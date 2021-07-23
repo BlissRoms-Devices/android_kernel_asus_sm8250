@@ -112,6 +112,6 @@ hwkm_qti-y += hwkm.o
 obj-$(CONFIG_MSM_BAM_DMUX) += bam_dmux.o
 
 #//ASUS_BSP Eason: check high or low level camera device
-ifeq ($(ASUS_BUILD_PROJECT),ZS670KS)
+ifdef CONFIG_MACH_ASUS_ZS670KS
 KBUILD_CFLAGS += -DZS670KS_PROJECT
 endif
