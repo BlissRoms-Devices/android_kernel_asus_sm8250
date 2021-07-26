@@ -5601,11 +5601,11 @@ void asus_display_set_panel_aod_bl()
 		asus_alpm_bl_high = 344;
 		asus_alpm_bl_low = 0;
 	} else if (strncmp(lcd_stage, "4", 1) == 0) { //ER2
-		asus_alpm_bl_high = 300;
-		asus_alpm_bl_low = 12;
+		asus_alpm_bl_high = 100;
+		asus_alpm_bl_low = 3;
 	} else if (strncmp(lcd_stage, "5", 1) == 0) { //PR
-		asus_alpm_bl_high = 300;
-		asus_alpm_bl_low = 12;
+		asus_alpm_bl_high = 100;
+		asus_alpm_bl_low = 3;
 	} else {
 		asus_alpm_bl_high = 344;
 		asus_alpm_bl_low = 0;
