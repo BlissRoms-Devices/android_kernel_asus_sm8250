@@ -99,8 +99,6 @@ void hdd_wlan_suspend_resume_event(uint8_t state)
 	WLAN_HOST_DIAG_EVENT_DEF(suspend_state, struct host_event_suspend);
 	qdf_mem_zero(&suspend_state, sizeof(suspend_state));
 
-	hdd_info("%s: suspend_state is %d", __func__, state);
-
 	suspend_state.state = state;
 	WLAN_HOST_DIAG_EVENT_REPORT(&suspend_state, EVENT_WLAN_SUSPEND_RESUME);
 }
@@ -260,6 +258,7 @@ static void hdd_disable_gtk_offload(struct hdd_adapter *adapter)
 /**
  * __wlan_hdd_ipv6_changed() - IPv6 notifier callback function
  * @net_dev: net_device whose IP address changed
+ * @event: event from kernel, NETDEV_UP or NETDEV_DOWN
  *
  * This is a callback function that is registered with the kernel via
  * register_inet6addr_notifier() which allows the driver to be
@@ -267,7 +266,8 @@ static void hdd_disable_gtk_offload(struct hdd_adapter *adapter)
  *
  * Return: None
  */
-static void __wlan_hdd_ipv6_changed(struct net_device *net_dev)
+static void __wlan_hdd_ipv6_changed(struct net_device *net_dev,
+				    unsigned long event)
 {
 	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(net_dev);
 	struct hdd_context *hdd_ctx;
@@ -284,8 +284,12 @@ static void __wlan_hdd_ipv6_changed(struct net_device *net_dev)
 	if (errno)
 		goto exit;
 
-	if (adapter->device_mode == QDF_STA_MODE ||
-	    adapter->device_mode == QDF_P2P_CLIENT_MODE) {
+	/* Only need to be notified for ipv6_add_addr
+	 * No need for ipv6_del_addr or addrconf_ifdown
+	 */
+	if (event == NETDEV_UP &&
+	    (adapter->device_mode == QDF_STA_MODE ||
+	     adapter->device_mode == QDF_P2P_CLIENT_MODE)) {
 		hdd_debug("invoking sme_dhcp_done_ind");
 		sme_dhcp_done_ind(hdd_ctx->mac_handle, adapter->vdev_id);
 		schedule_work(&adapter->ipv6_notifier_work);
@@ -305,7 +309,7 @@ int wlan_hdd_ipv6_changed(struct notifier_block *nb,
 	if (osif_vdev_sync_op_start(net_dev, &vdev_sync))
 		return NOTIFY_DONE;
 
-	__wlan_hdd_ipv6_changed(net_dev);
+	__wlan_hdd_ipv6_changed(net_dev, data);
 
 	osif_vdev_sync_op_stop(vdev_sync);
 
@@ -1206,7 +1210,7 @@ hdd_suspend_wlan(void)
 	struct hdd_adapter *adapter = NULL;
 	uint32_t conn_state_mask = 0;
 
-	hdd_info("[wlan]: hdd_suspend_wlan +. WLAN being suspended by OS");
+	hdd_info("WLAN being suspended by OS");
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
 	if (!hdd_ctx) {
@@ -1249,7 +1253,6 @@ hdd_suspend_wlan(void)
 	hdd_configure_sar_sleep_index(hdd_ctx);
 
 	hdd_wlan_suspend_resume_event(HDD_WLAN_EARLY_SUSPEND);
-	hdd_info("[wlan]: hdd_suspend_wlan -.");
 
 	return 0;
 }
@@ -1265,7 +1268,7 @@ static int hdd_resume_wlan(void)
 	struct hdd_adapter *adapter;
 	QDF_STATUS status;
 
-	hdd_info("[wlan]: hdd_resumed_wlan +. WLAN being resumed by OS");
+	hdd_info("WLAN being resumed by OS");
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
 	if (!hdd_ctx) {
@@ -1309,7 +1312,6 @@ static int hdd_resume_wlan(void)
 
 	hdd_configure_sar_resume_index(hdd_ctx);
 
-	hdd_info("[wlan]: hdd_resumed_wlan -.");
 	return 0;
 }
 
@@ -1353,7 +1355,7 @@ QDF_STATUS hdd_wlan_shutdown(void)
 	struct hdd_context *hdd_ctx;
 	void *soc = cds_get_context(QDF_MODULE_ID_SOC);
 
-	hdd_info("[wlan]: hdd_wlan_shutdown +. WLAN driver shutting down!");
+	hdd_info("WLAN driver shutting down!");
 
 	/* Get the HDD context. */
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
@@ -1413,7 +1415,6 @@ QDF_STATUS hdd_wlan_shutdown(void)
 
 	hdd_info("WLAN driver shutdown complete");
 
-	hdd_info("[wlan]: hdd_wlan_shutdown -.");
 	return QDF_STATUS_SUCCESS;
 }
 
@@ -2456,6 +2457,7 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(ndev);
 	int status;
 	struct hdd_station_ctx *sta_ctx;
+	static bool is_rate_limited;
 
 	hdd_enter_dev(ndev);
 
@@ -2500,8 +2502,11 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 		return 0;
 	}
 
-	if (hdd_ctx->driver_status != DRIVER_MODULES_ENABLED) {
-		hdd_debug("Driver Module not enabled return success");
+	HDD_IS_RATE_LIMIT_REQ(is_rate_limited,
+			      hdd_ctx->config->nb_commands_interval);
+	if (hdd_ctx->driver_status != DRIVER_MODULES_ENABLED ||
+	    is_rate_limited) {
+		hdd_debug("Modules not enabled/rate limited, use cached stats");
 		/* Send cached data to upperlayer*/
 		*dbm = adapter->hdd_stats.class_a_stat.max_pwr;
 		return 0;

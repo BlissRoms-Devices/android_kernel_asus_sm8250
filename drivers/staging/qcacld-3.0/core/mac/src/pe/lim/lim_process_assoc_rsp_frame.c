@@ -474,47 +474,6 @@ static void lim_stop_reassoc_retry_timer(struct mac_context *mac_ctx)
 	lim_deactivate_and_change_timer(mac_ctx, eLIM_REASSOC_FAIL_TIMER);
 }
 
-#ifdef WLAN_FEATURE_11W
-static void
-lim_handle_assoc_reject_status(struct mac_context *mac_ctx,
-				struct pe_session *session_entry,
-				tpSirAssocRsp assoc_rsp,
-				tSirMacAddr source_addr)
-{
-	struct sir_rssi_disallow_lst ap_info = {{0}};
-	uint32_t timeout_value =
-		assoc_rsp->TimeoutInterval.timeoutValue;
-
-	if (!(session_entry->limRmfEnabled &&
-		    assoc_rsp->status_code == eSIR_MAC_TRY_AGAIN_LATER &&
-		   (assoc_rsp->TimeoutInterval.present &&
-			(assoc_rsp->TimeoutInterval.timeoutType ==
-				SIR_MAC_TI_TYPE_ASSOC_COMEBACK))))
-		return;
-
-	/*
-	 * Add to rssi reject list, which takes care of retry
-	 * delay too. Fill the RSSI as 0, so the only param
-	 * which will allow the bssid to connect is retry delay.
-	 */
-	ap_info.retry_delay = timeout_value;
-	qdf_mem_copy(ap_info.bssid.bytes, source_addr, QDF_MAC_ADDR_SIZE);
-	ap_info.expected_rssi = LIM_MIN_RSSI;
-	lim_add_bssid_to_reject_list(mac_ctx->pdev, &ap_info);
-
-	pe_debug("ASSOC res with eSIR_MAC_TRY_AGAIN_LATER recvd. Add to time reject list(rssi reject in mac_ctx %d",
-		timeout_value);
-}
-#else
-static void
-lim_handle_assoc_reject_status(struct mac_context *mac_ctx,
-				struct pe_session *session_entry,
-				tpSirAssocRsp assoc_rsp,
-				tSirMacAddr source_addr)
-{
-}
-#endif
-
 /**
  * lim_get_nss_supported_by_ap() - finds out nss from AP's beacons
  * @vht_caps: VHT capabilities
@@ -702,11 +661,11 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 		return;
 	}
 
-	pe_nofl_info("Assoc rsp RX: subtype %d vdev %d sys role %d lim state %d rssi %d from " QDF_MAC_ADDR_STR,
+	pe_nofl_info("Assoc rsp RX: subtype %d vdev %d sys role %d lim state %d rssi %d from " QDF_MAC_ADDR_FMT,
 		     subtype, session_entry->vdev_id,
 		     GET_LIM_SYSTEM_ROLE(session_entry),
 		     session_entry->limMlmState, rssi,
-		     QDF_MAC_ADDR_ARRAY(hdr->sa));
+		     QDF_MAC_ADDR_REF(hdr->sa));
 	QDF_TRACE_HEX_DUMP(QDF_MODULE_ID_PE, QDF_TRACE_LEVEL_DEBUG,
 			   (uint8_t *)hdr, frame_len + SIR_MAC_HDR_LEN_3A);
 
@@ -746,8 +705,8 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 			 * other than one to which request was initiated.
 			 * Ignore this and wait until Assoc Failure Timeout
 			 */
-			pe_warn("received AssocRsp from unexpected peer "QDF_MAC_ADDR_STR,
-				QDF_MAC_ADDR_ARRAY(hdr->sa));
+			pe_warn("received AssocRsp from unexpected peer "QDF_MAC_ADDR_FMT,
+				QDF_MAC_ADDR_REF(hdr->sa));
 			qdf_mem_free(beacon);
 			return;
 		}
@@ -760,8 +719,8 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 			 * other than one to which request was initiated.
 			 * Ignore this and wait until Reassoc Failure Timeout.
 			 */
-			pe_warn("received ReassocRsp from unexpected peer "QDF_MAC_ADDR_STR,
-				QDF_MAC_ADDR_ARRAY(hdr->sa));
+			pe_warn("received ReassocRsp from unexpected peer "QDF_MAC_ADDR_FMT,
+				QDF_MAC_ADDR_REF(hdr->sa));
 			qdf_mem_free(beacon);
 			return;
 		}
@@ -850,8 +809,6 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 		return;
 	}
 	lim_copy_u16((uint8_t *) &mac_capab, caps);
-	lim_handle_assoc_reject_status(mac_ctx, session_entry, assoc_rsp,
-				       hdr->sa);
 
 	if (eSIR_MAC_XS_FRAME_LOSS_POOR_CHANNEL_RSSI_STATUS ==
 	   assoc_rsp->status_code &&
@@ -869,6 +826,10 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 		ap_info.retry_delay = assoc_rsp->rssi_assoc_rej.retry_delay *
 							QDF_MC_TIMER_TO_MS_UNIT;
 		qdf_mem_copy(ap_info.bssid.bytes, hdr->sa, QDF_MAC_ADDR_SIZE);
+		ap_info.reject_reason = REASON_ASSOC_REJECT_OCE;
+		ap_info.source = ADDED_BY_DRIVER;
+		ap_info.original_timeout = ap_info.retry_delay;
+		ap_info.received_time = qdf_mc_timer_get_system_time();
 		lim_add_bssid_to_reject_list(mac_ctx->pdev, &ap_info);
 	}
 
@@ -1057,8 +1018,8 @@ lim_process_assoc_rsp_frame(struct mac_context *mac_ctx,
 		qdf_mem_free(beacon);
 		return;
 	}
-	pe_debug("Successfully Associated with BSS " QDF_MAC_ADDR_STR,
-		 QDF_MAC_ADDR_ARRAY(hdr->sa));
+	pe_debug("Successfully Associated with BSS " QDF_MAC_ADDR_FMT,
+		 QDF_MAC_ADDR_REF(hdr->sa));
 #ifdef FEATURE_WLAN_ESE
 	if (session_entry->eseContext.tsm.tsmInfo.state)
 		session_entry->eseContext.tsm.tsmMetrics.RoamingCount = 0;
@@ -1170,10 +1131,10 @@ assocReject:
 		&& (session_entry->limMlmState ==
 		    eLIM_MLM_WT_FT_REASSOC_RSP_STATE))) {
 		pe_err("Assoc Rejected by the peer mlmestate: %d sessionid: %d Reason: %d MACADDR:"
-			QDF_MAC_ADDR_STR,
+			QDF_MAC_ADDR_FMT,
 			session_entry->limMlmState,
 			session_entry->peSessionId,
-			assoc_cnf.resultCode, QDF_MAC_ADDR_ARRAY(hdr->sa));
+			assoc_cnf.resultCode, QDF_MAC_ADDR_REF(hdr->sa));
 		session_entry->limMlmState = eLIM_MLM_IDLE_STATE;
 		MTRACE(mac_trace(mac_ctx, TRACE_CODE_MLM_STATE,
 			session_entry->peSessionId,
