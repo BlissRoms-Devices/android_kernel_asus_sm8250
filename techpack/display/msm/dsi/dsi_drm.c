@@ -11,6 +11,7 @@
 #include "sde_connector.h"
 #include "dsi_drm.h"
 #include "sde_trace.h"
+#include "sde_encoder.h"
 
 #define to_dsi_bridge(x)     container_of((x), struct dsi_bridge, base)
 #define to_dsi_state(x)      container_of((x), struct dsi_connector_state, base)
@@ -20,16 +21,10 @@
 #define DEFAULT_PANEL_JITTER_ARRAY_SIZE		2
 #define DEFAULT_PANEL_PREFILL_LINES	25
 
-static struct dsi_display_mode_priv_info default_priv_info = {
-	.panel_jitter_numer = DEFAULT_PANEL_JITTER_NUMERATOR,
-	.panel_jitter_denom = DEFAULT_PANEL_JITTER_DENOMINATOR,
-	.panel_prefill_lines = DEFAULT_PANEL_PREFILL_LINES,
-	.dsc_enabled = false,
-};
-
+/* ASUS BSP Display +++ */
 extern bool asus_display_in_normal_off(void);
 
-static void dsi_bridge_asus_dfps(struct drm_bridge *bridge)
+static void dsi_bridge_asus_dfps(struct drm_bridge *bridge, int type)
 {
 	int rc = 0;
 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
@@ -44,13 +39,21 @@ static void dsi_bridge_asus_dfps(struct drm_bridge *bridge)
 		return;
 	}
 
-	rc = dsi_display_asus_dfps(c_bridge->display);
+	rc = dsi_display_asus_dfps(c_bridge->display, type);
 	if (rc) {
 		pr_err("[%d] failed to perform a fps set, rc=%d\n",
 			c_bridge->id, rc);
 		return;
 	}
 }
+/* ASUS BSP Display --- */
+
+static struct dsi_display_mode_priv_info default_priv_info = {
+	.panel_jitter_numer = DEFAULT_PANEL_JITTER_NUMERATOR,
+	.panel_jitter_denom = DEFAULT_PANEL_JITTER_DENOMINATOR,
+	.panel_prefill_lines = DEFAULT_PANEL_PREFILL_LINES,
+	.dsc_enabled = false,
+};
 
 static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
 				struct dsi_display_mode *dsi_mode)

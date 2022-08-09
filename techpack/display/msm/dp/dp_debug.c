@@ -1899,6 +1899,35 @@ static const struct file_operations hdcp_fops = {
 	.write = dp_debug_write_hdcp,
 	.read = dp_debug_read_hdcp,
 };
+/* ASUS BSP Display +++ */
+static ssize_t dp_debug_read_aux_err(struct file *file,
+		char __user *user_buff, size_t count, loff_t *ppos)
+{
+	struct dp_debug_private *debug = file->private_data;
+	char buf[SZ_8];
+	u32 len = 0;
+
+	if (!debug)
+		return -ENODEV;
+
+	if (*ppos)
+		return 0;
+
+	len += snprintf(buf, SZ_8, "%d\n", debug->dp_debug.aux_err);
+
+	len = min_t(size_t, count, len);
+	if (copy_to_user(user_buff, buf, len))
+		return -EFAULT;
+
+	*ppos += len;
+	return len;
+}
+
+static const struct file_operations aux_err_fops = {
+	.open = simple_open,
+	.read = dp_debug_read_aux_err,
+};
+/* ASUS BSP Display --- */
 
 static const struct file_operations widebus_mode_fops = {
 	.open = simple_open,
@@ -2074,6 +2103,15 @@ static int dp_debug_init(struct dp_debug *dp_debug)
 			DEBUG_NAME, rc);
 		goto error_remove_dir;
 	}
+	/* ASUS BSP Display +++ */
+	file = debugfs_create_file("aux_err", 0644, dir, debug, &aux_err_fops);
+	if (IS_ERR_OR_NULL(file)) {
+		rc = PTR_ERR(file);
+		DP_ERR("[%s] debugfs aux_err failed, rc=%d\n",
+		       DEBUG_NAME, rc);
+		return rc;
+	}
+	/* ASUS BSP Display --- */
 
 	file = debugfs_create_file("sim", 0644, dir,
 		debug, &sim_fops);
