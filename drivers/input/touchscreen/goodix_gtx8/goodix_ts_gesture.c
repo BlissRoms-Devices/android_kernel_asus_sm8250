@@ -50,6 +50,8 @@ extern bool asus_var_regulator_always_on;
 extern void asus_display_report_fod_touched(void);
 extern struct goodix_ts_core *gts_core_data;
 extern bool proximityStatus(void);
+extern bool in_aod_doze_mode;
+
 // ASUS_BSP --- Touch
 /*
  * struct gesture_module - gesture module data
@@ -779,7 +781,7 @@ static int report_gesture_key(struct input_dev *dev, char keycode)
 		}
 	}
 
-	if(atomic_read(&gsx_gesture->aod_enable)==1) {
+	if(in_aod_doze_mode) {
 		if(keycode == 'F') {
 			input_switch_key(dev, KEY_F);
 			ts_info("KEY_F");
@@ -1027,7 +1029,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 
 	if (QUERYBIT(gsx_gesture->gesture_type, gsx_type)) {
 		/* do resume routine */
-		if((atomic_read(&gsx_gesture->aod_enable)==1) || (atomic_read(&gsx_gesture->aod_ctrl_mode)==1)) {
+		if((in_aod_doze_mode) || (atomic_read(&gsx_gesture->aod_ctrl_mode)==1)) {
 			if (temp_data[4] == 0x46){
 				//ts_info("Get KEY_F X and Y");
 				ret = ts_dev->hw_ops->read_trans(ts_dev, ts_dev->reg.gesture + key_data_len, &temp_data[key_data_len], 34);  

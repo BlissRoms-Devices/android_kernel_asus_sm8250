@@ -102,6 +102,7 @@ int  asus_var_hbm_fps_list[5]      = {60, 90, 120, 144, 160};
 int  asus_var_hbm_on_delay[5]      = {33, 22,  17,  14,  12}; //delay time in ms to hang fod layer after hbm on  (2 vsyncs)
 int  asus_var_hbm_off_delay[5]     = {50, 33,  25,  21,  19}; //delay time in ms to hang fod layer after hbm off (3 vsyncs)
 int  asus_var_hbm_off_delay_aod[5] = {50, 50,  50,  50,  50}; //delay time in ms to hang fod layer after hbm off in aod (no longer needed)
+bool in_aod_doze_mode = false;
 
 // variables external
 extern int  asus_current_fps;           //from drm_atomic_helper.c
@@ -1402,6 +1403,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 			// ASUS_BSP +++ Touch
 			phone_touch_suspend();
 			// ASUS_BSP --- Touch
+			in_aod_doze_mode = true;
 		}
 
 		// set the default AOD backlight to the last backlight
@@ -1425,6 +1427,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 			g_display->panel->asus_global_hbm_mode = 0;
 		}
 		rc = dsi_panel_set_lp2(display->panel);
+		in_aod_doze_mode = true;
 		break;
 	case SDE_MODE_DPMS_ON:
 		if ((display->panel->power_mode == SDE_MODE_DPMS_LP1 ||
@@ -1450,6 +1453,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 
 		// switch the correct fps from upper layer
 		asus_display_apply_fps_setting();
+		in_aod_doze_mode = false;
 		break;
 	case SDE_MODE_DPMS_OFF:
 	default:
