@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
@@ -147,6 +147,7 @@ static void _sde_core_perf_calc_doze_suspend(struct drm_crtc *crtc,
 	}
 }
 
+extern bool asus_var_ever_power_off;
 static void _sde_core_perf_calc_crtc(struct sde_kms *kms,
 		struct drm_crtc *crtc,
 		struct drm_crtc_state *state,
@@ -217,6 +218,12 @@ static void _sde_core_perf_calc_crtc(struct sde_kms *kms,
 		perf->core_clk_rate = max(kms->perf.fix_core_clk_rate,
 						perf->core_clk_rate);
 	}
+
+	// use default max core clock rate as ROG2
+	if (asus_var_ever_power_off)
+		perf->core_clk_rate = 460000000;
+	else
+		perf->core_clk_rate = 459999999;
 
 	SDE_EVT32(DRMID(crtc), perf->core_clk_rate,
 		GET_H32(perf->bw_ctl[SDE_POWER_HANDLE_DBUS_ID_MNOC]),
@@ -676,10 +683,6 @@ static void _sde_core_perf_crtc_update_bus(struct sde_kms *kms,
 	bus_ab_quota = max(bw_sum_of_intfs, kms->perf.perf_tune.min_bus_vote);
 	bus_ib_quota = perf.max_per_pipe_ib[bus_id];
 
-	if (!kms->perf.sde_rsc_available)
-		bus_ib_quota = max(SDE_POWER_HANDLE_ENABLE_BUS_IB_QUOTA,
-					bus_ib_quota);
-
 	if (kms->perf.perf_tune.mode == SDE_PERF_MODE_FIXED) {
 		bus_ab_quota = max(kms->perf.fix_core_ab_vote,
 					bus_ab_quota);
@@ -1092,6 +1095,9 @@ static ssize_t _sde_core_perf_threshold_high_read(struct file *file,
 	return len;
 }
 
+// ASUS BSP DisplayPort +++
+extern bool asus_display_in_normal_off(void);
+
 static ssize_t _sde_core_perf_mode_write(struct file *file,
 		    const char __user *user_buf, size_t count, loff_t *ppos)
 {
@@ -1100,6 +1106,13 @@ static ssize_t _sde_core_perf_mode_write(struct file *file,
 	u32 perf_mode = 0;
 	char buf[10];
 	int ret = 0;
+
+	// ASUS BSP DisplayPort +++
+	if (asus_display_in_normal_off()) {
+		pr_err("[Display] performance mode return.\n");
+		return -EFAULT;
+	}
+	// ASUS BSP DisplayPort ---
 
 	if (!perf)
 		return -ENODEV;

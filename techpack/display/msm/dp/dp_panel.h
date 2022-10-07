@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  */
 
 #ifndef _DP_PANEL_H_
@@ -136,17 +136,22 @@ struct dp_panel {
 
 	s64 fec_overhead_fp;
 
+	/* ASUS BSP Display +++ */
+	char *asus_vendor;
+	u32 asus_proc_codes;
+
 	int (*init)(struct dp_panel *dp_panel);
 	int (*deinit)(struct dp_panel *dp_panel, u32 flags);
 	int (*hw_cfg)(struct dp_panel *dp_panel, bool enable);
 	int (*read_sink_caps)(struct dp_panel *dp_panel,
 		struct drm_connector *connector, bool multi_func);
+	u32 (*get_min_req_link_rate)(struct dp_panel *dp_panel);
 	u32 (*get_mode_bpp)(struct dp_panel *dp_panel, u32 mode_max_bpp,
 			u32 mode_pclk_khz);
 	int (*get_modes)(struct dp_panel *dp_panel,
 		struct drm_connector *connector, struct dp_display_mode *mode);
 	void (*handle_sink_request)(struct dp_panel *dp_panel);
-	int (*set_edid)(struct dp_panel *dp_panel, u8 *edid, size_t edid_size);
+	int (*set_edid)(struct dp_panel *dp_panel, u8 *edid);
 	int (*set_dpcd)(struct dp_panel *dp_panel, u8 *dpcd);
 	int (*setup_hdr)(struct dp_panel *dp_panel,
 		struct drm_msm_ext_hdr_metadata *hdr_meta,
@@ -230,4 +235,12 @@ struct dp_panel *dp_panel_get(struct dp_panel_in *in);
 void dp_panel_put(struct dp_panel *dp_panel);
 void dp_panel_calc_tu_test(struct dp_tu_calc_input *in,
 		struct dp_vc_tu_mapping_table *tu_table);
+/* ASUS BSP Display +++ */
+bool dp_asus_validate_24_bpp(struct dp_panel *dp_panel);
+bool dp_asus_validate_mode(struct dp_panel *dp_panel, struct drm_display_mode *mode);
+void dp_asus_extract_id(struct dp_panel *dp_panel);
+bool dp_asus_ignore_link_train_failure(struct dp_panel *dp_panel);
+bool dp_asus_is_station(void);
+bool dp_asus_is_dt_dock(void);
+/* ASUS BSP Display --- */
 #endif /* _DP_PANEL_H_ */

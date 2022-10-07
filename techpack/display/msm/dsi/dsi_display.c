@@ -20,10 +20,12 @@
 #include "dsi_pwr.h"
 #include "sde_dbg.h"
 #include "dsi_parser.h"
-
+/* ASUS BSP Display +++ */
 #include <linux/proc_fs.h>
 #include <linux/string.h>
 #include <linux/syscalls.h>
+#include <drm/drm_sysfs.h>
+/* ASUS BSP Display --- */
 
 #define to_dsi_display(x) container_of(x, struct dsi_display, host)
 #define INT_BASE_10 10
@@ -37,25 +39,6 @@
 #define DSI_CLOCK_BITRATE_RADIX 10
 #define MAX_TE_SOURCE_ID  2
 
-#define MIN_LEN 2
-#define MAX_LEN 4
-#define REG_BUF_SIZE 4096
-
-#define LCD_REGISTER_RW              "driver/panel_reg_rw"
-#define LCD_UNIQUE_ID                "lcd_unique_id"
-#define LCD_FPS                      "driver/lcd_fps"
-#define LCD_STAGE                    "lcd_stage"
-#define HBM_MODE                     "hbm_mode"
-#define DIMMING_SPEED                "lcd_dimming_speed"
-#define LCD_BACKLIGNTNESS            "lcd_brightness"
-
-
-static struct mutex asus_display_cmd_mutex;
-
-char asus_var_reg_buffer[REG_BUF_SIZE]; //panel register readback buffer
-extern int asus_current_fps;            //Display current fps
-extern bool need_change_fps;            //from drm_atomic_helper.c
-
 static char dsi_display_primary[MAX_CMDLINE_PARAM_LEN];
 static char dsi_display_secondary[MAX_CMDLINE_PARAM_LEN];
 static struct dsi_display_boot_param boot_displays[MAX_DSI_ACTIVE_DISPLAY] = {
@@ -68,32 +51,119 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{}
 };
 
-extern int fts_ts_suspend(void);
-extern int fts_ts_resume(void);
-extern int dsi_panel_update_backlight(struct dsi_panel *panel,u32 bl_lvl);
-static int dsi_host_alloc_cmd_tx_buffer(struct dsi_display *display);
-static int dsi_display_cmd_engine_enable(struct dsi_display *display);
-static int dsi_display_cmd_engine_disable(struct dsi_display *display);
+/*
+ * ROG3 display protocol definitions
+ */
+// for register read write
+#define MIN_LEN 2
+#define MAX_LEN 4
+#define REG_BUF_SIZE 4096
+
+// proc file names
+#define LCD_REGISTER_RW              "driver/panel_reg_rw"
+#define LCD_UNIQUE_ID                "lcd_unique_id"
+#define HBM_MODE                     "hbm_mode"
+#define DIM_MODE                     "dim_mode"
+#define LCD_STAGE                    "lcd_stage"
+#define DISPLAY_BACKLIGHT_DELAY      "display_bl"
+#define GLOBAL_HBM_MODE              "globalHbm"
+#define GLOBAL_HBM_FOD_MODE          "globalHbm_fod"
+#define LOCAL_HBM_MODE               "localHbm"
+#define LCD_REG_AWS_ON               "driver/panel_power_always_on"
+#define LCD_FPS                      "driver/lcd_fps"
+#define LCD_POWER_MODE               "driver/panel_power_mode"
+#define HBM_MODE_ON_DELAY            "driver/hbm_on_delay"
+#define HBM_MODE_OFF_DELAY           "driver/hbm_off_delay"
+#define INITIAL_CODE_VERSION         "driver/lcd_code_version"
+
+// HDCP version
+#define HDCP_VERSION                 "hdcp_version"
+int  g_hdcp_version = 1;
+
+static struct mutex asus_display_cmd_mutex;
+
+// variables that only inside display driver
+bool asus_var_osc_reg_feteched = false; //flag to indicate if OSC was recorded
+char asus_var_osc_reg_p20_value = 0xa;  //default OSC p20(reg index 19) value
+bool asus_var_idle_reg_state = false;   //read Tcon to get real panel idle state
+bool asus_var_manual_idle_out = false;  //if FOD had set us out of idle
+char asus_var_panel_unique_id[8];       //panel unique ID
+char asus_var_panel_stage[3];           //panel stage
+char asus_var_reg_buffer[REG_BUF_SIZE]; //panel register readback buffer
+bool asus_var_ever_power_off = false;   //workaround for boost MDP clock
+int  asus_alpm_bl_high = 344;
+int  asus_alpm_bl_low = 0;
+char lcd_stage[10];
+
+// variables that only used for test
+bool asus_var_regulator_always_on = false; //display power never turned off
+bool asus_var_global_hbm_pending = false;  //display global hbm pending
+int  asus_var_hbm_fps_list[5]      = {60, 90, 120, 144, 160};
+int  asus_var_hbm_on_delay[5]      = {33, 22,  17,  14,  12}; //delay time in ms to hang fod layer after hbm on  (2 vsyncs)
+int  asus_var_hbm_off_delay[5]     = {50, 33,  25,  21,  19}; //delay time in ms to hang fod layer after hbm off (3 vsyncs)
+int  asus_var_hbm_off_delay_aod[5] = {50, 50,  50,  50,  50}; //delay time in ms to hang fod layer after hbm off in aod (no longer needed)
+
+// variables external
+extern int  asus_current_fps;           //from drm_atomic_helper.c
+extern bool need_change_fps;            //from drm_atomic_helper.c
+extern bool asus_fps_overriding;        //from drm_atomic_helper.c
+extern bool asus_blocking_fps_until_bootup;
+extern bool old_has_fov_makser;         //from sde_crtc.c
+
+// functions that only inside display driver
+void asus_display_read_panel_osc(struct dsi_display *display);
+void asus_display_set_dimming(u32 cur_bl);
 void asus_display_get_tcon_cmd(char cmd, int rlen);
 void asus_display_set_tcon_cmd(char *cmd, short len, int type);
+void asus_display_set_global_hbm(int mode);
+void asus_display_set_global_hbm_fod(void);
+void asus_display_set_panel_aod_bl(void);
+int  asus_display_get_global_hbm_delay(bool on);
+void asus_display_set_global_hbm_delay(bool on, int value);
 
-static  bool asus_display_valid(void)
-{
-	if (!g_display) {
-		printk("[Display][%pS] g_display is not valid.\n", __builtin_return_address(0));
-		return false;
-	}
-	return true;
-}
+// display driver workqueue
+static struct workqueue_struct *asus_display_wq;
 
-static bool asus_display_panel_valid(void)
+// workqueue functions contain recovery flicker workaround
+#define ASUS_RECOVERY_WORKAROUND     0
+#if ASUS_RECOVERY_WORKAROUND
+extern bool g_Charger_mode;             //from cmdline
+extern bool g_Recovery_mode;            //from cmdline
+static void asus_display_recovery_mode_workfunc(struct work_struct *);
+static DECLARE_DELAYED_WORK(asus_display_recovery_mode_work, asus_display_recovery_mode_workfunc);
+void set_panel_in_recovery(void);
+#endif
+
+// workqueue functions contain reset backlight after GHBM
+static void asus_display_reset_brightness_workfunc(struct work_struct *);
+static DECLARE_DELAYED_WORK(asus_display_reset_brightness_work, asus_display_reset_brightness_workfunc);
+
+// ASUS_BSP +++ Touch
+extern void phone_touch_resume(void);
+extern void phone_touch_suspend(void);
+// ASUS_BSP --- Touch
+
+//Bottom USB RT1715 +++
+extern void rt_send_screen_resume(void);
+//Bottom USB RT1715 ---
+
+bool asus_display_in_aod(void)
 {
-	if (!g_display || !g_display->panel) {
-		printk("[Display][%pS] display or panel is not valid.\n", __builtin_return_address(0));
-		return false;
+	if (asus_display_panel_valid()) {
+		switch (g_display->panel->power_mode) {
+		case SDE_MODE_DPMS_LP1:
+		case SDE_MODE_DPMS_LP2:
+			return true;
+		case SDE_MODE_DPMS_ON:
+		case SDE_MODE_DPMS_OFF:
+			return false;
+		}
 	}
-	return true;
+
+	pr_err("[Display] display is not initialized, state is not ready\n");
+	return false;
 }
+EXPORT_SYMBOL(asus_display_in_aod);
 
 bool asus_display_in_normal_on(void)
 {
@@ -115,805 +185,163 @@ bool asus_display_in_normal_off(void)
 }
 EXPORT_SYMBOL(asus_display_in_normal_off);
 
-bool asus_display_in_aod(void)
+int asus_display_global_hbm_mode(void)
 {
-	if (asus_display_panel_valid()) {
-		switch (g_display->panel->power_mode) {
-		case SDE_MODE_DPMS_LP1:
-		case SDE_MODE_DPMS_LP2:
-			return true;
-		case SDE_MODE_DPMS_ON:
-		case SDE_MODE_DPMS_OFF:
-			return false;
-		}
-	}
-
-	pr_err("[Display] display is not initialized, state is not ready\n");
-	return false;
+	return g_display->panel->asus_global_hbm_mode;
 }
-EXPORT_SYMBOL(asus_display_in_aod);
+EXPORT_SYMBOL(asus_display_global_hbm_mode);
 
+static int dsi_display_dynamic_clk_configure_cmd(struct dsi_display *d, int c);
 void asus_display_apply_fps_setting(void)
 {
 	if (!asus_display_valid()) {
 		return;
 	}
 
+	if (g_display->panel->asus_global_hbm_mode == 1) {
+		printk("[Display] skip fps %d due to GHBM\n", asus_current_fps);
+		return;
+	}
+
 	if (asus_current_fps >= 60 && asus_current_fps < 90)
-		dsi_panel_asus_switch_fps(g_display->panel);
-	else if (asus_current_fps >= 90)
-		dsi_panel_asus_switch_fps(g_display->panel);
-	else {
-		pr_err("[Display] asus_display_apply_fps_setting invalid fps is  (%d)\n", asus_current_fps);
-	}
+		dsi_panel_asus_switch_fps(g_display->panel, 2);
+	else if (asus_current_fps >= 90 && asus_current_fps < 120)
+		dsi_panel_asus_switch_fps(g_display->panel, 1);
+	else if (asus_current_fps >= 120 && asus_current_fps < 144)
+		dsi_panel_asus_switch_fps(g_display->panel, 0);
+	else if (asus_current_fps == 144)
+		dsi_panel_asus_switch_fps(g_display->panel, 3);
+	else if (asus_current_fps == 160)
+		dsi_panel_asus_switch_fps(g_display->panel, 4);
+
+	if (asus_current_fps == 160)
+		dsi_display_dynamic_clk_configure_cmd(g_display, 0);
 }
 
-void asus_display_set_hbm(int mode, int type)
+extern int sde_encoder_wait_for_event(struct drm_encoder *drm_encoder, enum msm_event_wait event);
+void asus_display_wait_for_vsync(void)
 {
-	char hdm_on_cmd[2]={0x53,0xE8};
-	char hdm_off_cmd[2]={0x53,0x28};
-	
+	sde_encoder_wait_for_event(g_display->bridge->base.encoder, MSM_ENC_VBLANK);
+}
+EXPORT_SYMBOL(asus_display_wait_for_vsync);
+
+void asus_display_check_idle_mode(bool want_idle)
+{
 	if (!asus_display_panel_valid())
 		return;
 
-	if (mode == g_display->panel->asus_hbm_mode) {
-		pr_err("[Display] mode same, but do it anyway\n");
+#if 0
+	// cost too much time to get tcon cmd
+	asus_display_get_tcon_cmd(0x0a, 1);
+
+	// if we want to exit LP idle mode for FOD, we do not need to
+	// modify the correct power mode
+	if (asus_var_idle_reg_state && !want_idle) {
+		pr_err("[Display] manual set idle (%d)\n", want_idle);
+		dsi_panel_set_idle(g_display->panel, want_idle);
+		//asus_display_apply_fps_setting();
+		asus_var_manual_idle_out = true;
 	}
-
-	// check to exit idle mode
-	//asus_display_check_idle_mode(false);
-
-	g_display->panel->asus_hbm_mode = mode;
-	printk("[Display] hbm set to (%d)\n", mode);
-
-	// hbm debug
-	/*
-	if ( g_display->panel->asus_global_hbm_mode == 1 ){
-		printk("[Display] global_hbm_mode == 1 , return\n");
-		return;
-	}*/
-
-	if(1 == mode) {
-		asus_display_set_tcon_cmd(hdm_on_cmd,sizeof(hdm_on_cmd),0);
-	} else if(0 == mode) {
-		asus_display_set_tcon_cmd(hdm_off_cmd,sizeof(hdm_off_cmd),0);
+#else
+	if (asus_display_in_aod() && !want_idle) {
+		pr_err("[Display] manual set idle (%d)\n", want_idle);
+		dsi_panel_set_idle(g_display->panel, want_idle);
+		asus_display_apply_fps_setting();
+		asus_var_manual_idle_out = true;
 	}
-	
+#endif
 }
 
-static ssize_t asus_display_proc_hbm_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+u32 asus_display_get_backlight(void)
 {
-	char messages[256];
-	//int timeout = 100;
-	memset(messages, 0, sizeof(messages));
-
-	if (len > 256)
-		len = 256;
-	if (copy_from_user(messages, buff, len))
-		return -EFAULT;
-
-	if (!asus_display_panel_valid())
-		return -EFAULT;
-
-	pr_err("[Display] hbm write +++ \n");
-	
-	if (!asus_display_in_normal_off()) {
-		if (strncmp(messages, "0", 1) == 0) {
-			asus_display_set_hbm(0, 0);
-		} else if (strncmp(messages, "1", 1) == 0) {
-			asus_display_set_hbm(1, 0);
-		} else {
-			pr_err("[Display] don't match any hbm mode.\n");
-		}
-	} else {
-		pr_err("[Display] unable to set in display off\n");
-		g_display->panel->asus_hbm_mode = 0;
-	}
-
-	pr_err("[Display] hbm write --- \n");
-
-	return len;
-}
-
-static ssize_t asus_display_proc_hbm_read(struct file *file, char __user *buf,
-							 size_t count, loff_t *ppos)
-{
-	int len = 0;
-	ssize_t ret = 0;
-	char *buff;
-
-	buff = kzalloc(100, GFP_KERNEL);
-	if (!buff)
-		return -ENOMEM;
-
-	if (!asus_display_panel_valid())
-		return -EFAULT;
-
-	len += sprintf(buff, "%d\n", g_display->panel->asus_hbm_mode);
-	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
-	kfree(buff);
-
-	return ret;
-}
-
-static struct file_operations asus_display_proc_hbm_ops = {
-	.write = asus_display_proc_hbm_write,
-	.read  = asus_display_proc_hbm_read,
-};
-
-int dsi_panel_asus_first_switch_90_fps(void)
-{
-	int rc = 0;
-	struct dsi_panel *panel = g_display->panel;
-	char fps_90_cmd[2]={0x60,0x10};
-
-	if (!panel || !panel->dfps_caps.dfps_support || asus_display_in_normal_off()) {
-		pr_err("[Display] invalid operation to set fps\n");
-		return -EINVAL;
-	}
-
-	pr_err("[Display] ddsi_panel_asus_first_switch_90_fps.\n");
-
-	asus_display_set_tcon_cmd(fps_90_cmd,sizeof(fps_90_cmd),0);
-
-	return rc;
-}
-EXPORT_SYMBOL(dsi_panel_asus_first_switch_90_fps);
-
-void zs670ks_display_get_tcon_cmd(char cmd, char *return_buf,int rlen)
-{
-	u32 flags = 0;
-	u8 *tx_buf, *status_buf;
-	int rc = 0;
-
-	struct dsi_cmd_desc cmds;
-	struct mipi_dsi_msg tcon_cmd = {0, 0x06, 0, 0, 0, sizeof(cmd), NULL, rlen, NULL};
-	struct dsi_display_ctrl *mctrl;
-	struct dsi_panel *panel;
-
-	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
-	if (!mctrl || !mctrl->ctrl)
-		return;
-
-	panel = g_display->panel;
-	dsi_panel_acquire_panel_lock(panel);
-
-	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON) {
-		mutex_lock(&asus_display_cmd_mutex);
-		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
-
-		if (g_display->tx_cmd_buf == NULL) {
-			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
-			if (rc) {
-				pr_err("[Display] failed to allocate cmd tx buffer memory (%d)\n", rc);
-				goto error_disable_clks;
-			}
-		}
-
-		rc = dsi_display_cmd_engine_enable(g_display);
-		if (rc) {
-			pr_err("[Display]cmd engine enable failed(%d)\n", rc);
-			goto error_disable_clks;
-		}
-
-		tx_buf = &cmd;
-		status_buf = kzalloc(SZ_4K, GFP_KERNEL);
-		memset(status_buf, 0x0, SZ_4K);
-
-		cmds.msg = tcon_cmd;
-		cmds.last_command = 1;
-		cmds.post_wait_ms = 0;
-
-		if (cmds.last_command) {
-			cmds.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
-			flags |= DSI_CTRL_CMD_LAST_COMMAND;
-		}
-		flags |= (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
-
-		cmds.msg.tx_buf = tx_buf;
-		cmds.msg.rx_buf = status_buf;
-		cmds.msg.rx_len = rlen;
-
-		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &cmds.msg, &flags);
-		if (rc <= 0) {
-			pr_err("[Display] rx cmd transfer failed rc=%d\n", rc);
-		} else {
-			pr_err("[Display] rx cmd transfer succeed cmd=0x%02x\n", cmd);
-			memcpy(return_buf, status_buf, rlen);
-		}
-
-		dsi_display_cmd_engine_disable(g_display);
-		goto error_disable_clks;
-	}else {
-		pr_err("[Display] %s: panel is off\n", __func__);
-		dsi_panel_release_panel_lock(panel);
-		return;
-	}
-
-error_disable_clks:
-	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
-	mutex_unlock(&asus_display_cmd_mutex);
-	dsi_panel_release_panel_lock(panel);
-
-}
-
-void asus_display_get_tcon_cmd(char cmd, int rlen)
-{
-	char tmp[256];
-	u32 flags = 0;
-	int i = 0, rc = 0, start = 0;
-	u8 *tx_buf, *return_buf, *status_buf;
-
-	struct dsi_cmd_desc cmds;
-	struct mipi_dsi_msg tcon_cmd = {0, 0x06, 0, 0, 0, sizeof(cmd), NULL, rlen, NULL};
-	struct dsi_display_ctrl *mctrl;
-	struct dsi_panel *panel;
-
-	if (!asus_display_panel_valid())
-		return;
-
-	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
-
-	if (!mctrl || !mctrl->ctrl)
-		return;
-
-	panel = g_display->panel;
-	dsi_panel_acquire_panel_lock(panel);
-
-	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON) {
-		mutex_lock(&asus_display_cmd_mutex);
-		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
-
-		if (g_display->tx_cmd_buf == NULL) {
-			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
-			if (rc) {
-				pr_err("[Display] failed to allocate cmd tx buffer memory (%d)\n", rc);
-				goto error_disable_clks;
-			}
-		}
-
-		rc = dsi_display_cmd_engine_enable(g_display);
-		if (rc) {
-			pr_err("[Display]cmd engine enable failed(%d)\n", rc);
-			goto error_disable_clks;
-		}
-
-		tx_buf = &cmd;
-		return_buf = kcalloc(rlen, sizeof(unsigned char), GFP_KERNEL);
-		status_buf = kzalloc(SZ_4K, GFP_KERNEL);
-		memset(status_buf, 0x0, SZ_4K);
-
-		cmds.msg = tcon_cmd;
-		cmds.last_command = 1;
-		cmds.post_wait_ms = 0;
-		if (cmds.last_command) {
-			cmds.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
-			flags |= DSI_CTRL_CMD_LAST_COMMAND;
-		}
-		flags |= (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
-
-		cmds.msg.tx_buf = tx_buf;
-		cmds.msg.rx_buf = status_buf;
-		cmds.msg.rx_len = rlen;
-		memset(asus_var_reg_buffer, 0, REG_BUF_SIZE*sizeof(char));
-
-		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &cmds.msg, &flags);
-		if (rc <= 0) {
-			pr_err("[Display] rx cmd transfer failed rc=%d\n", rc);
-		} else {
-			pr_err("[Display] rx cmd transfer succeed rc=%d\n", rc);
-			memcpy(return_buf + start, status_buf, rlen);
-			start += rlen;
-
-			for(i = 0; i < rlen; i++) {
-				memset(tmp, 0, 256 * sizeof(char));
-				snprintf(tmp, sizeof(tmp), "0x%02x = 0x%02x\n", cmd, return_buf[i]);
-				strcat(asus_var_reg_buffer,tmp);
-				// read panel osc p20
-				// the first length of 20 reading will be treated as osc reading
-				//if (!asus_var_osc_reg_feteched && rlen == 20)
-				//	asus_var_osc_reg_p20_value = return_buf[19];
-			}
-		}
-
-		// 0xA is the idle mode reading command, save it
-		/*if (cmd == 0xa) {
-			if ( return_buf[0] == 0x5C )
-				asus_var_idle_reg_state = true;
-			else
-				asus_var_idle_reg_state = false;
-			pr_err("[Display] panel power = 0x%02x\n", return_buf[0]);
-		}*/
-
-		dsi_display_cmd_engine_disable(g_display);
-		goto error_disable_clks;
-	} else {
-		pr_err("[Display] %s: panel is off\n", __func__);
-		dsi_panel_release_panel_lock(panel);
-		return;
-	}
-
-error_disable_clks:
-	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
-	mutex_unlock(&asus_display_cmd_mutex);
-	dsi_panel_release_panel_lock(panel);
-}
-
-void asus_display_set_tcon_cmd(char *cmd, short len, int type)
-{
-	int i = 0, rc = 0;
-	struct dsi_cmd_desc cmds;
-	struct mipi_dsi_msg tcon_cmd = {0, 0x15, 0, 0, 0, len, cmd, 0, NULL};
-	struct dsi_display_ctrl *mctrl;
-	struct dsi_panel *panel;
-	u32 flags = 0;
-
-	for(i=0; i<1/*len*/; i++)
-		pr_info("[Display] cmd%d (0x%02x)\n", i, cmd[i]);
-
-	if(len > 2)
-		tcon_cmd.type = 0x39;
-
-
-	if (!asus_display_panel_valid())
-		return;
-
-	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
-
-	if (!mctrl || !mctrl->ctrl)
-		return;
-
-	panel = g_display->panel;
-	dsi_panel_acquire_panel_lock(panel);
-
-	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON 
-		&&	(!asus_display_in_normal_off() )) { // prevent send command in normal off state
-		mutex_lock(&asus_display_cmd_mutex);
-		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
-
-		if (g_display->tx_cmd_buf == NULL) {
-			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
-			if (rc) {
-				pr_err("[Display] failed to allocate cmd tx buffer memory (%d)\n", rc);
-				goto error_disable_clks;
-			}
-		}
-
-		rc = dsi_display_cmd_engine_enable(g_display);
-		if (rc) {
-			pr_err("[Display] cmd engine enable failed(%d)\n", rc);
-			goto error_disable_clks;
-		}
-
-		flags |= DSI_CTRL_CMD_FETCH_MEMORY;
-		cmds.msg = tcon_cmd;
-		cmds.last_command = 1;
-		cmds.post_wait_ms = 1;
-		if (cmds.last_command) {
-			cmds.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
-		}
-
-		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &cmds.msg, &flags);
-		if (rc)
-			pr_err("[Display] cmd transfer failed, rc=%d\n", rc);
-
-		dsi_display_cmd_engine_disable(g_display);
-		goto error_disable_clks;
-	} else {
-		pr_err("[Display] %s: panel is off\n", __func__);
-		dsi_panel_release_panel_lock(panel);
-		return;
-	}
-
-error_disable_clks:
-	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
-	mutex_unlock(&asus_display_cmd_mutex);
-	dsi_panel_release_panel_lock(panel);
-}
-
-EXPORT_SYMBOL(asus_display_set_tcon_cmd);
-
-char zs670ks_lcd_stage = 0;
-
-void ZS670KS_display_lcd_stage_read(void)
-{
-	zs670ks_display_get_tcon_cmd(0xDA,&zs670ks_lcd_stage,sizeof(zs670ks_lcd_stage));
-
-	pr_err("[Display] read lcd stage is 0x%02x\n",zs670ks_lcd_stage);
-
-}
-EXPORT_SYMBOL(ZS670KS_display_lcd_stage_read);
-
-static ssize_t asus_display_proc_lcd_stage_read(struct file *file, char __user *buf, 
-				size_t count, loff_t *ppos)
-{
-	int len = 0;
-	ssize_t ret = 0;
-	char *buff;
-
-	if (!asus_display_panel_valid())
-		return -EINVAL;
-
-	buff = kzalloc(256, GFP_KERNEL);
-	if (!buff)
-		return -ENOMEM;
-
-	len += sprintf(buff, "%02x\n", zs670ks_lcd_stage);
-	
-	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
-	kfree(buff);
-	
-	return ret;
-}
-
-static struct file_operations asus_display_proc_lcd_stage_ops = {
-	.read = asus_display_proc_lcd_stage_read,
-};
-
-char asus_uid[5] = {0};
-
-void ZS670KS_uniqie_id_get(void)
-{
-	char zs670ks_unique[16] = {0};
-	char final_unique[8] = {0};
-	int i = 0;
-
-	zs670ks_display_get_tcon_cmd(0xa1,zs670ks_unique,sizeof(zs670ks_unique));
-
-	pr_err("[Display] : Read unique is 0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x\n",
-		zs670ks_unique[0],zs670ks_unique[1],zs670ks_unique[2],zs670ks_unique[3],zs670ks_unique[4],zs670ks_unique[5],zs670ks_unique[6],zs670ks_unique[7],zs670ks_unique[8],zs670ks_unique[9],zs670ks_unique[10],zs670ks_unique[11],zs670ks_unique[12],zs670ks_unique[13],zs670ks_unique[14]);
-
-	zs670ks_unique[15] = 0;
-
-	for(i=0;i<7;i++)
-	{
-		final_unique[i] = zs670ks_unique[i+4];
-	}
-	final_unique[7] = 0;
-
-	asus_uid[3] = final_unique[6];
-	asus_uid[2] = final_unique[2]^final_unique[5];
-	asus_uid[1] = final_unique[1]^final_unique[4];
-	asus_uid[0] = final_unique[0]^final_unique[3]^final_unique[6];
-
-}
-EXPORT_SYMBOL(ZS670KS_uniqie_id_get);
-
-static ssize_t asus_display_proc_unique_id_read(struct file *file, char __user *buf, 
-				size_t count, loff_t *ppos)
-{
-	int len = 0;
-	ssize_t ret = 0;
-	char *buff;
-
-	buff = kzalloc(256, GFP_KERNEL);
-	if (!buff)
-		return -ENOMEM;
-	
-	len += sprintf(buff, "%02x%02x%02x%02x\n", asus_uid[0],asus_uid[1],asus_uid[2],asus_uid[3],asus_uid[4]);
-	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
-	kfree(buff);
-
-	return ret;
-}
-
-static struct file_operations asus_display_proc_unique_id_ops = {
-	.read = asus_display_proc_unique_id_read,
-};
-
-static ssize_t asus_display_proc_fps_write(struct file *filp, const char *buff, size_t len, loff_t *off)
-{
-	char messages[256];
-	char fps_90_cmd[2]={0x60,0x10};
-	char fps_60_cmd[2]={0x60,0x00};
-	int  old_temp_fps = 0;
-
-	memset(messages, 0, sizeof(messages));
-
-	if (len > 256)
-		len = 256;
-	if (copy_from_user(messages, buff, len))
-		return -EFAULT;
-
-	if (!asus_display_panel_valid())
-		return -EINVAL;
-
-	old_temp_fps = asus_current_fps;
-	
-	if (strncmp(messages, "90", 2) == 0) {
-		if(90 == old_temp_fps) {
-			pr_err("[Display] current is 90 FPS, no need update.\n");
-			return len;
-		}
-		asus_current_fps = 90;
-		need_change_fps = true;
-		asus_display_set_tcon_cmd(fps_90_cmd,sizeof(fps_90_cmd),0);
-	} else if (strncmp(messages, "60", 2) == 0) {
-		if(60 == old_temp_fps) {
-			pr_err("[Display] current is 60 FPS, no need update.\n");
-			return len;
-		}
-		asus_current_fps = 60;
-		need_change_fps = true;
-		asus_display_set_tcon_cmd(fps_60_cmd,sizeof(fps_60_cmd),0);
-	} else {
-		pr_err("[Display] don't match any avaiable fps.\n");
-		return -EINVAL;
-	}
-
-	return len;
-}
-
-static ssize_t asus_display_proc_fps_read(struct file *file, char __user *buf,
-							 size_t count, loff_t *ppos)
-{
-	int len = 0;
-	ssize_t ret = 0;
-	char *buff;
-	char zs670ks_fps = 0;
-	int proc_fps = 0;
-
-	if (!asus_display_panel_valid())
-		return -EINVAL;
-
-	buff = kzalloc(100, GFP_KERNEL);
-	if (!buff)
-		return -ENOMEM;
-
-	zs670ks_display_get_tcon_cmd(0x61,&zs670ks_fps,sizeof(zs670ks_fps));
-
-	if(0x10 == zs670ks_fps)
-	{
-		proc_fps = 90;
-	}
+	if (asus_display_panel_valid())
+		return g_display->panel->bl_config.bl_level;
 	else
-	{
-		proc_fps = 60;
-	}
+		return 0;
+}
+EXPORT_SYMBOL(asus_display_get_backlight);
 
-	pr_err("[Display] read fps is %d\n",proc_fps);
-		
-	len += sprintf(buff, "%d\n", proc_fps);
-	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
-	kfree(buff);
-
-	return ret;
+void asus_display_reset_brightness(void)
+{
+	queue_delayed_work(asus_display_wq, &asus_display_reset_brightness_work, msecs_to_jiffies(50));
 }
 
-static struct file_operations asus_display_proc_fps_ops = {
-	.write = asus_display_proc_fps_write,
-	.read  = asus_display_proc_fps_read,
-};
-
-static ssize_t asus_display_proc_dimming_speed_write(struct file *filp, const char *buff, size_t len, loff_t *off)
-{
-	char messages[256];
-	memset(messages, 0, sizeof(messages));
-
-	if (len > 256)
-		len = 256;
-	
-	if (copy_from_user(messages, buff, len))
-		return -EFAULT;
-
-	if (!asus_display_panel_valid())
-		return -EFAULT;
-
-	pr_err("[Display] dimming speed write +++ val:%s \n",messages);
-	
-	if (!asus_display_in_normal_off()) {
-		if (strncmp(messages, "1", 1) == 0) {
-			dsi_panel_set_dimming_speed(g_display->panel, 1);
-		} else if (strncmp(messages, "20", 2) == 0) {
-			dsi_panel_set_dimming_speed(g_display->panel, 20);
-		} else {
-			pr_err("[Display] don't match any dimming speed .\n");
+static void asus_display_reset_brightness_workfunc(struct work_struct *ws){
+	printk("[Display] leaving GHBM, check hbm & brightness");
+	// reset backlight level if request to turn off GHBM
+	if (g_display->panel->asus_global_hbm_pending_mode == 0) {
+		if (g_display->panel->asus_global_hbm_cached_bl > 1) {
+			printk("[Display] setting cached backlight %d\n", g_display->panel->asus_global_hbm_cached_bl);
+			dsi_panel_set_backlight(g_display->panel, g_display->panel->asus_global_hbm_cached_bl);
+			g_display->panel->asus_global_hbm_cached_bl = 0;
 		}
-	} else {
-		pr_err("[Display] unable to set in display off\n");
+		printk("[Display] global hbm off, reset hbm mode\n");
+		dsi_panel_set_hbm(g_display->panel, g_display->panel->asus_hbm_mode);
 	}
-
-	pr_err("[Display] dimming speed write --- \n");
-
-	return len;
 }
 
-static struct file_operations asus_display_proc_dimming_speed_ops = {
-	.write = asus_display_proc_dimming_speed_write,
-};
-
-static ssize_t asus_display_proc_lcd_brightness_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+void asus_primary_display_commit(void)
 {
-	char messages[256];
-	u32 backlight_lvl = 0;
-	int rc = 0;
+	if (asus_var_global_hbm_pending) {
 
-	memset(messages, 0, sizeof(messages));
+		pr_err("[Display] sending global hbm setting to panel");
 
-	if (len > 256)
-		len = 256;
-	
-	if (copy_from_user(messages, buff, len))
-		return -EFAULT;
+		// We want to align VSYNC in both on/off hbm
+		//sde_encoder_wait_for_event(g_display->bridge->base.encoder, MSM_ENC_VBLANK);
 
-	if (!asus_display_panel_valid())
-		return -EFAULT;
+		asus_display_set_global_hbm_fod();
 
-	pr_err("[Display] dc lcd brightess write +++ val:%s \n",messages);
-
-	sscanf(messages, "%u", &backlight_lvl);
-
-	pr_err("[Display] dc lcd brightess need change backlightnes : %d\n",backlight_lvl);
-	
-	if (!asus_display_in_normal_off()) {
-		rc =  dsi_panel_update_backlight(g_display->panel,backlight_lvl);
-		if(rc < 0)
-			pr_err("[Display]: dsi_panel_update_backlight error! \n");
-		
-	} else {
-		pr_err("[Display] unable to set in display off\n");
-	}
-
-	pr_err("[Display]  dc lcd brightess --- \n");
-
-	return len;
-}
-
-static struct file_operations asus_display_proc_lcd_brightness_ops = {
-	.write = asus_display_proc_lcd_brightness_write,
-};
-
-static ssize_t asus_display_proc_reg_rw(struct file *filp, const char *buff, size_t len, loff_t *off)
-{
-	char *messages, *tmp, *cur;
-	char *token, *token_par;
-	char *put_cmd;
-	bool flag = 0; /* w/r type : w=1, r=0 */
-	int *store;
-	int i = 0, cnt = 0, cmd_cnt = 0;
-	int ret = 0;
-	uint8_t str_len = 0;
-
-	messages = (char*) kmalloc(len*sizeof(char), GFP_KERNEL);
-	if(!messages)
-		return -EFAULT;
-
-	tmp = (char*) kmalloc(len*sizeof(char), GFP_KERNEL);
-	memset(tmp, 0, len*sizeof(char));
-	store =  (int*) kmalloc((len/MIN_LEN)*sizeof(int), GFP_KERNEL);
-	put_cmd = (char*) kmalloc((len/MIN_LEN)*sizeof(char), GFP_KERNEL);
-	memset(asus_var_reg_buffer, 0, REG_BUF_SIZE*sizeof(char));
-
-	/* add '\0' to end of string */
-	if (copy_from_user(messages, buff, len)) {
-		ret = -1;
-		goto error;
-	}
-
-	cur = messages;
-	*(cur+len-1) = '\0';
-	pr_err("[Display] %s (%s) +++\n", __func__, cur);
-
-	if (strncmp(cur, "w", 1) == 0)
-		flag = true;
-	else if(strncmp(cur, "r", 1) == 0)
-		flag = false;
-	else {
-		ret = -1;
-		goto error;
-	}
-
-	while ((token = strsep(&cur, "wr")) != NULL) {
-		str_len = strlen(token);
-
-		if(str_len > 0) { /* filter zero length */
-			if(!(strncmp(token, ",", 1) == 0) || (str_len < MAX_LEN)) {
-				ret = -1;
-				goto error;
-			}
-
-			memset(store, 0, (len/MIN_LEN)*sizeof(int));
-			memset(put_cmd, 0, (len/MIN_LEN)*sizeof(char));
-			cmd_cnt++;
-
-			/* register parameter */
-			while ((token_par = strsep(&token, ",")) != NULL) {
-				if(strlen(token_par) > MIN_LEN) {
-					ret = -1;
-					goto error;
-				}
-				if(strlen(token_par)) {
-					sscanf(token_par, "%x", &(store[cnt]));
-					cnt++;
-				}
-			}
-
-			for(i=0; i<cnt; i++)
-				put_cmd[i] = store[i]&0xff;
-
-			if(flag) {
-				pr_err("[Display] write panel command\n");
-				asus_display_set_tcon_cmd(put_cmd, cnt, 0);
-			}
-			else {
-				pr_err("[Display] read panel command 0x%02x,%d\n",put_cmd[0], store[1]);
-				asus_display_get_tcon_cmd(put_cmd[0], store[1]);
-			}
-
-			if(cur != NULL) {
-				if (*(tmp+str_len) == 'w')
-					flag = true;
-				else if (*(tmp+str_len) == 'r')
-					flag = false;
-			}
-			cnt = 0;
+		// the delay parameter for fod layer
+		if(g_display->panel->asus_global_hbm_pending_mode == 1) {
+			udelay(asus_display_get_global_hbm_delay(true)*1000);
+			asus_drm_notify(ASUS_NOTIFY_GHBM_ON_READY, 1);
+			g_display->panel->asus_global_hbm_mode = 1;
+			pr_err("[Display] globalHbm set to 1");
+		} else if(g_display->panel->asus_global_hbm_pending_mode == 0) {
+			udelay(asus_display_get_global_hbm_delay(false)*1000);
+			asus_drm_notify(ASUS_NOTIFY_GHBM_ON_READY, 0);
+			g_display->panel->asus_global_hbm_mode = 0;
+			asus_display_set_dimming(0); // reset dimming parameter
+			asus_display_apply_fps_setting(); // restore correct target fps setting
+			pr_err("[Display] globalHbm set to 0");
 		}
-
-		memset(tmp, 0, len*sizeof(char));
-
-		if(cur != NULL)
-			strcpy(tmp, cur);
 	}
-
-	if(cmd_cnt == 0) {
-		ret = -1;
-		goto error;
-	}
-
-	ret = len;
-
-error:
-	pr_err("[Display] %s(%d) ---\n", __func__, ret);
-	kfree(messages);
-	kfree(tmp);
-	kfree(store);
-	kfree(put_cmd);
-	return ret;
 }
 
-static ssize_t asus_display_proc_reg_result_read(struct file *file, char __user *buf,
-				 size_t count, loff_t *ppos)
+void asus_display_report_fod_touched(void)
 {
-	int len = 0;
-	ssize_t ret = 0;
-	char *buff;
-
-	buff = kzalloc(SZ_4K, GFP_KERNEL);
-	if (!buff)
-		return -ENOMEM;
-
-	len += sprintf(buff, "%s\n", asus_var_reg_buffer);
-	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
-	kfree(buff);
-
-	return ret;
+	asus_drm_notify(ASUS_NOTIFY_FOD_TOUCHED, 1);
 }
 
-static struct file_operations asus_display_proc_reg_rw_ops = {
-	.write = asus_display_proc_reg_rw,
-	.read = asus_display_proc_reg_result_read,
-};
-
-int dsi_display_asus_dfps(struct dsi_display *display)
+//
+// Asus LCD cmdline parameters
+//
+static int asus_cmdline_lcd_unique_id(char *str)
 {
-	int rc = 0;
-
-	if (!display || !display->panel) {
-		pr_err("Invalid params\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&display->display_lock);
-
-	rc = dsi_panel_asus_switch_fps(display->panel);
-	if (rc) {
-		pr_err("[%s] failed to enable DSI panel, rc=%d\n",
-			display->name, rc);
-	}
-
-	mutex_unlock(&display->display_lock);
-	return rc;
+	scnprintf(asus_var_panel_unique_id, sizeof(asus_var_panel_unique_id), str);
+	printk("[Display] lcd unique id = %s\n",  asus_var_panel_unique_id);
+	return 0;
 }
+__setup("LCD=", asus_cmdline_lcd_unique_id);
+
+static int asus_cmdline_panel_osc(char *str)
+{
+	char osc_p2_value_from_xbl; //not used anymore, but keep it here
+	sscanf(str, "%02x", &osc_p2_value_from_xbl);
+	printk("[Display] osc p2 = %02x\n",  osc_p2_value_from_xbl);
+	return 0;
+}
+__setup("P2=", asus_cmdline_panel_osc);
+
+static int asus_cmdline_lcd_stage(char *str)
+{
+	scnprintf(asus_var_panel_stage, sizeof(asus_var_panel_stage), str);
+	printk("[Display] lcd stage = %s\n",  asus_var_panel_stage);
+	return 0;
+}
+__setup("LS=", asus_cmdline_lcd_stage);
+
+// End of ROG3 display protocol definitions
 
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
 			u32 mask, bool enable)
@@ -1113,6 +541,12 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 
 error:
 	mutex_unlock(&panel->panel_lock);
+	/* ASUS BSP Display +++ */
+	// delay backlight setting by fps
+	if (panel->asus_bl_delay != 0)
+		udelay(panel->asus_bl_delay);
+
+	asus_display_set_dimming(bl_lvl);
 	return rc;
 }
 
@@ -1491,6 +925,38 @@ static void dsi_display_parse_te_data(struct dsi_display *display)
 	}
 
 	display->te_source = val;
+
+	// ASUS BSP Display parse fod gpios
+	display->asus_fod_exi1_gpio = of_get_named_gpio(dev->of_node,
+					"asus,platform-fod-exi1-gpio", 0);
+
+	display->asus_fod_exi2_gpio = of_get_named_gpio(dev->of_node,
+					"asus,platform-fod-exi2-gpio", 0);
+
+	pr_err("[Display] FOD exi1 read is %d, exi2 read is %d.\n", display->asus_fod_exi1_gpio,
+				display->asus_fod_exi2_gpio);
+
+	rc = gpio_request(display->asus_fod_exi1_gpio, "goodix_lhbm_exi1");
+	if (rc) {
+		pr_err("[Display] failed to request goodix_lhbm_exi1 gpio, rc = %d\n", rc);
+		goto err_lhbm_exi1;
+	}
+
+	rc = gpio_request(display->asus_fod_exi2_gpio, "goodix_lhbm_exi2");
+	if (rc) {
+		pr_err("[Display] failed to request goodix_lhbm_exi2 gpio, rc = %d\n", rc);
+		goto err_lhbm_exi2;
+	}
+
+	gpio_direction_output(display->asus_fod_exi1_gpio, 0);
+	gpio_direction_output(display->asus_fod_exi2_gpio, 0);
+
+	return;
+
+err_lhbm_exi2:
+    gpio_free(display->asus_fod_exi2_gpio);
+err_lhbm_exi1:
+    gpio_free(display->asus_fod_exi1_gpio);
 }
 
 static int dsi_display_read_status(struct dsi_display_ctrl *ctrl,
@@ -1681,7 +1147,7 @@ int dsi_display_check_status(struct drm_connector *connector, void *display,
 		rc = -EINVAL;
 		goto release_panel_lock;
 	}
-	SDE_EVT32(SDE_EVTLOG_FUNC_ENTRY, status_mode, te_check_override);
+	SDE_EVT32(SDE_EVTLOG_FUNC_ENTRY);
 
 	if (te_check_override && gpio_is_valid(dsi_display->disp_te_gpio))
 		status_mode = ESD_MODE_PANEL_TE;
@@ -1729,7 +1195,7 @@ exit:
 
 release_panel_lock:
 	dsi_panel_release_panel_lock(panel);
-	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT, rc);
+	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
 
 	return rc;
 }
@@ -1753,9 +1219,6 @@ static int dsi_display_cmd_prepare(const char *cmd_buf, u32 cmd_buf_len,
 		       cmd->msg.tx_len, payload_len);
 		return -EINVAL;
 	}
-
-	if (cmd->last_command)
-		cmd->msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
 
 	for (i = 0; i < cmd->msg.tx_len; i++)
 		payload[i] = cmd_buf[7 + i];
@@ -1922,42 +1385,86 @@ int dsi_display_set_power(struct drm_connector *connector,
 		return -EINVAL;
 	}
 
-	printk("[Display] dsi_display_set_power +++\n");
+	pr_err("[Display] dsi_display_set_power +++ \n");
 
 	switch (power_mode) {
 	case SDE_MODE_DPMS_LP1:
-		printk("[Display] SDE_MODE_DPMS_LP1\n");
-		rc = dsi_panel_set_lp1(display->panel);
-		fts_ts_suspend();
+		pr_err("[Display] enter LP1 doze\n");
+		if (g_display->panel->asus_global_hbm_mode && asus_var_manual_idle_out) {
+			printk("[Display] BUG: do not enter LP1 while GHBM\n");
+			break;
+		}
+		if (asus_var_manual_idle_out || !asus_display_in_aod()) {
+			pr_err("[Display] set LP1 command\n");
+			rc = dsi_panel_set_lp1(display->panel);
+			asus_display_set_panel_aod_bl();
+			asus_var_manual_idle_out = false;
+			// ASUS_BSP +++ Touch
+			phone_touch_suspend();
+			// ASUS_BSP --- Touch
+		}
+
+		// set the default AOD backlight to the last backlight
+		if (g_display->panel->asus_last_user_aod_bl != 0)
+			dsi_panel_set_backlight(g_display->panel, g_display->panel->asus_last_user_aod_bl);
 		break;
 	case SDE_MODE_DPMS_LP2:
-		printk("[Display] SDE_MODE_DPMS_LP2\n");
+		pr_err("[Display] enter LP2 doze suspend\n");
+		if (asus_var_manual_idle_out) {
+			printk("[Display] previous idle out, send LP1 command\n");
+
+			// if global hbm is on, turn it off in doze suspend
+			dsi_panel_set_global_hbm(g_display->panel, 0);
+			rc = dsi_panel_set_lp1(display->panel);
+			asus_display_set_panel_aod_bl();
+			asus_var_manual_idle_out = false;
+			old_has_fov_makser = false;
+			asus_drm_notify(ASUS_NOTIFY_SPOT_READY, 0);
+			asus_drm_notify(ASUS_NOTIFY_GHBM_ON_READY, 0);
+			asus_drm_notify(ASUS_NOTIFY_GHBM_ON_REQ, 0);
+			g_display->panel->asus_global_hbm_mode = 0;
+		}
 		rc = dsi_panel_set_lp2(display->panel);
 		break;
 	case SDE_MODE_DPMS_ON:
-		printk("[Display] SDE_MODE_DPMS_ON\n");
-		if ((display->panel->power_mode == SDE_MODE_DPMS_LP1) ||
-			(display->panel->power_mode == SDE_MODE_DPMS_LP2))
+		if ((display->panel->power_mode == SDE_MODE_DPMS_LP1 ||
+			display->panel->power_mode == SDE_MODE_DPMS_LP2) &&
+			!asus_var_manual_idle_out) {
+			pr_err("[Display] exit AOD, enter NOLP\n");
 			rc = dsi_panel_set_nolp(display->panel);
+		}
 
-		fts_ts_resume();
+		if (display->panel->power_mode == SDE_MODE_DPMS_LP2 &&
+			display->panel->asus_global_hbm_mode) {
+			pr_err("[Display] LP2 -> ON and need global HBM, re-enable it\n");
+			asus_var_global_hbm_pending = true;
+		}
+
+		// ASUS_BSP +++ Touch
+		phone_touch_resume();
+		// ASUS_BSP --- Touch
+
+		//Bottom USB RT1715 +++
+		rt_send_screen_resume();
+		//Bottom USB RT1715 ---
+
+		// switch the correct fps from upper layer
 		asus_display_apply_fps_setting();
-		ASUSEvtlog("[PM]request_suspend_state: (3->0)\n");
-		printk("request_suspend_state: (3->0)\n");
 		break;
 	case SDE_MODE_DPMS_OFF:
 	default:
 		return rc;
 	}
 
-	SDE_EVT32(display->panel->power_mode, power_mode, rc);
 	DSI_DEBUG("Power mode transition from %d to %d %s",
 			display->panel->power_mode, power_mode,
 			rc ? "failed" : "successful");
 	if (!rc)
 		display->panel->power_mode = power_mode;
+	else
+		pr_err("[Display] set power mode failed with rc[%d], the state might be wrong.\n", rc);
 
-	printk("[Display] dsi_display_set_power ---\n");
+	pr_err("[Display] dsi_display_set_power --- \n");
 
 	return rc;
 }
@@ -3689,19 +3196,6 @@ static int dsi_display_broadcast_cmd(struct dsi_display *display,
 		goto error;
 	}
 
-	display_for_each_ctrl(i, display) {
-		ctrl = &display->ctrl[i];
-		if (ctrl == m_ctrl)
-			continue;
-
-		rc = dsi_ctrl_clear_slave_dma_status(ctrl->ctrl, flags);
-		if (rc) {
-			DSI_ERR("[%s] clear interrupt status failed, rc=%d\n",
-				display->name, rc);
-			goto error;
-		}
-	}
-
 error:
 	dsi_display_mask_overflow(display, m_flags, false);
 	return rc;
@@ -4960,7 +4454,6 @@ static int dsi_display_update_dsi_bitrate(struct dsi_display *display,
 		DSI_DEBUG("byte_clk_rate = %llu, byte_intf_clk_rate = %llu\n",
 			  byte_clk_rate, byte_intf_clk_rate);
 		DSI_DEBUG("pclk_rate = %llu\n", pclk_rate);
-		SDE_EVT32(i, bit_rate, byte_clk_rate, pclk_rate);
 
 		ctrl->clk_freq.byte_clk_rate = byte_clk_rate;
 		ctrl->clk_freq.byte_intf_clk_rate = byte_intf_clk_rate;
@@ -5237,6 +4730,15 @@ static int dsi_display_dynamic_clk_configure_cmd(struct dsi_display *display,
 {
 	int rc = 0;
 
+	if (asus_current_fps > 144) {
+		if (g_display && g_display->panel->asus_boost_panel_clock_rate_hz > 0)
+			clk_rate = g_display->panel->asus_boost_panel_clock_rate_hz;
+		else
+			clk_rate = 860000000;
+	}
+
+	printk("[Display] update clock rate to %ld \n", clk_rate);
+
 	if (clk_rate <= 0) {
 		DSI_ERR("%s: bitrate should be greater than 0\n", __func__);
 		return -EINVAL;
@@ -5251,7 +4753,7 @@ static int dsi_display_dynamic_clk_configure_cmd(struct dsi_display *display,
 
 	rc = dsi_display_update_dsi_bitrate(display, clk_rate);
 	if (!rc) {
-		DSI_INFO("%s: bit clk is ready to be configured to '%d'\n",
+		printk("[Display] %s: bit clk is ready to be configured to '%d'\n",
 				__func__, clk_rate);
 		atomic_set(&display->clkrate_change_pending, 1);
 	} else {
@@ -5451,9 +4953,6 @@ static int dsi_display_get_dfps_timing(struct dsi_display *display,
 				DSI_V_TOTAL(timing),
 				timing->v_front_porch,
 				&adj_mode->timing.v_front_porch);
-		SDE_EVT32(SDE_EVTLOG_FUNC_CASE1, DSI_DFPS_IMMEDIATE_VFP,
-			curr_refresh_rate, timing->refresh_rate,
-			timing->v_front_porch, adj_mode->timing.v_front_porch);
 		break;
 
 	case DSI_DFPS_IMMEDIATE_HFP:
@@ -5464,9 +4963,6 @@ static int dsi_display_get_dfps_timing(struct dsi_display *display,
 				DSI_H_TOTAL_DSC(timing),
 				timing->h_front_porch,
 				&adj_mode->timing.h_front_porch);
-		SDE_EVT32(SDE_EVTLOG_FUNC_CASE2, DSI_DFPS_IMMEDIATE_HFP,
-			curr_refresh_rate, timing->refresh_rate,
-			timing->h_front_porch, adj_mode->timing.h_front_porch);
 		if (!rc)
 			adj_mode->timing.h_front_porch *= display->ctrl_count;
 		break;
@@ -5543,7 +5039,7 @@ static int dsi_display_set_mode_sub(struct dsi_display *display,
 		return -EINVAL;
 	}
 
-	SDE_EVT32(mode->dsi_mode_flags, mode->panel_mode);
+	SDE_EVT32(mode->dsi_mode_flags);
 	if (mode->dsi_mode_flags & DSI_MODE_FLAG_POMS) {
 		display->config.panel_mode = mode->panel_mode;
 		display->panel->panel_mode = mode->panel_mode;
@@ -5671,7 +5167,7 @@ static int _dsi_display_dev_init(struct dsi_display *display)
 		return -EINVAL;
 	}
 
-	if (!display->panel_node && !display->fw)
+	if (!display->panel_node)
 		return 0;
 
 	mutex_lock(&display->display_lock);
@@ -5756,7 +5252,6 @@ int dsi_display_cont_splash_config(void *dsi_display)
 	/* Update splash status for clock manager */
 	dsi_display_clk_mngr_update_splash_status(display->clk_mngr,
 				display->is_cont_splash_enabled);
-	SDE_EVT32(SDE_EVTLOG_FUNC_ENTRY, display->is_cont_splash_enabled);
 
 	/* Set up ctrl isr before enabling core clk */
 	dsi_display_ctrl_isr_configure(display, true);
@@ -5828,7 +5323,6 @@ int dsi_display_splash_res_cleanup(struct  dsi_display *display)
 	dsi_display_clk_mngr_update_splash_status(display->clk_mngr,
 				display->is_cont_splash_enabled);
 
-	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT, display->is_cont_splash_enabled);
 	return rc;
 }
 
@@ -5839,17 +5333,1551 @@ static int dsi_display_force_update_dsi_clk(struct dsi_display *display)
 	rc = dsi_display_link_clk_force_update_ctrl(display->dsi_clk_handle);
 
 	if (!rc) {
-		DSI_INFO("dsi bit clk has been configured to %d\n",
+		printk("[Display] dsi bit clk has been configured to %d\n",
 			display->cached_clk_rate);
 
 		atomic_set(&display->clkrate_change_pending, 0);
 	} else {
-		DSI_ERR("Failed to configure dsi bit clock '%d'. rc = %d\n",
+		DSI_ERR("[Display] Failed to configure dsi bit clock '%d'. rc = %d\n",
 			display->cached_clk_rate, rc);
 	}
 
 	return rc;
 }
+
+/* ASUS BSP Display +++ */
+//
+// ASUS display util functions
+//
+static int display_atoi(char *nptr)
+{
+	int c;
+	long total;
+	int sign;
+
+	while (isspace((int)(unsigned char)*nptr))
+		++nptr;
+	c = (int)(unsigned char) *nptr++;
+	sign = c;
+	if (c == '-' || c == '+')
+		c = (int)(unsigned char) *nptr++;
+	total = 0;
+	while (isdigit(c)) {
+		total = 10 * total + (c - '0');
+		c = (int)(unsigned char) *nptr++;
+	}
+	if (sign == '-')
+		return (int)-total;
+	else
+		return (int)total;
+}
+
+void asus_display_set_tcon_cmd(char *cmd, short len, int type)
+{
+	int i = 0, rc = 0;
+	struct dsi_cmd_desc cmds;
+	struct mipi_dsi_msg tcon_cmd = {0, 0x15, 0, 0, 0, len, cmd, 0, NULL};
+	struct dsi_display_ctrl *mctrl;
+	struct dsi_panel *panel;
+	u32 flags;
+
+	for(i=0; i<1/*len*/; i++)
+		pr_info("[Display] cmd%d (0x%02x)\n", i, cmd[i]);
+
+	if(len > 2)
+		tcon_cmd.type = 0x39;
+
+	if (!asus_display_panel_valid())
+		return;
+
+	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
+
+	if (!mctrl || !mctrl->ctrl)
+		return;
+
+	panel = g_display->panel;
+	dsi_panel_acquire_panel_lock(panel);
+
+	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON  &&
+			(!asus_display_in_normal_off() || type)) { // prevent send command in normal off state
+		mutex_lock(&asus_display_cmd_mutex);
+		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
+
+		if (g_display->tx_cmd_buf == NULL) {
+			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
+			if (rc) {
+				pr_err("[Display] failed to allocate cmd tx buffer memory (%d)\n", rc);
+				goto error_disable_clks;
+			}
+		}
+
+		rc = dsi_display_cmd_engine_enable(g_display);
+		if (rc) {
+			pr_err("[Display] cmd engine enable failed(%d)\n", rc);
+			goto error_disable_clks;
+		}
+
+		cmds.msg = tcon_cmd;
+		cmds.last_command = 1;
+		cmds.post_wait_ms = 1;
+		if (cmds.last_command) {
+			cmds.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+		}
+
+		flags = DSI_CTRL_CMD_FETCH_MEMORY;
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &cmds.msg, &flags);
+		if (rc)
+			pr_err("[Display] cmd transfer failed, rc=%d\n", rc);
+
+		dsi_display_cmd_engine_disable(g_display);
+		goto error_disable_clks;
+	} else {
+		pr_err("[Display] %s: panel is off\n", __func__);
+		dsi_panel_release_panel_lock(panel);
+		return;
+	}
+
+error_disable_clks:
+	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
+	mutex_unlock(&asus_display_cmd_mutex);
+	dsi_panel_release_panel_lock(panel);
+}
+
+void asus_display_get_tcon_cmd(char cmd, int rlen)
+{
+	char tmp[256];
+	u32 flags = 0;
+	int i = 0, rc = 0, start = 0;
+	u8 *tx_buf, *return_buf, *status_buf;
+
+	struct dsi_cmd_desc cmds;
+	struct mipi_dsi_msg tcon_cmd = {0, 0x06, 0, 0, 0, sizeof(cmd), NULL, rlen, NULL};
+	struct dsi_display_ctrl *mctrl;
+	struct dsi_panel *panel;
+
+	if (!asus_display_panel_valid())
+		return;
+
+	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
+
+	if (!mctrl || !mctrl->ctrl)
+		return;
+
+	panel = g_display->panel;
+	dsi_panel_acquire_panel_lock(panel);
+
+	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON) {
+		mutex_lock(&asus_display_cmd_mutex);
+		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
+
+		if (g_display->tx_cmd_buf == NULL) {
+			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
+			if (rc) {
+				pr_err("[Display] failed to allocate cmd tx buffer memory (%d)\n", rc);
+				goto error_disable_clks;
+			}
+		}
+
+		rc = dsi_display_cmd_engine_enable(g_display);
+		if (rc) {
+			pr_err("[Display]cmd engine enable failed(%d)\n", rc);
+			goto error_disable_clks;
+		}
+
+		tx_buf = &cmd;
+		return_buf = kcalloc(rlen, sizeof(unsigned char), GFP_KERNEL);
+		status_buf = kzalloc(SZ_4K, GFP_KERNEL);
+		memset(status_buf, 0x0, SZ_4K);
+
+		cmds.msg = tcon_cmd;
+		cmds.last_command = 1;
+		cmds.post_wait_ms = 0;
+		if (cmds.last_command) {
+			cmds.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+			flags |= DSI_CTRL_CMD_LAST_COMMAND;
+		}
+		flags |= (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
+
+		cmds.msg.tx_buf = tx_buf;
+		cmds.msg.rx_buf = status_buf;
+		cmds.msg.rx_len = rlen;
+		memset(asus_var_reg_buffer, 0, REG_BUF_SIZE*sizeof(char));
+
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &cmds.msg, &flags);
+		if (rc <= 0) {
+			pr_err("[Display] rx cmd transfer failed rc=%d\n", rc);
+		} else {
+			pr_err("[Display] rx cmd transfer succeed rc=%d\n", rc);
+			memcpy(return_buf + start, status_buf, rlen);
+			start += rlen;
+
+			for(i = 0; i < rlen; i++) {
+				memset(tmp, 0, 256 * sizeof(char));
+				snprintf(tmp, sizeof(tmp), "0x%02x = 0x%02x\n", cmd, return_buf[i]);
+				strcat(asus_var_reg_buffer,tmp);
+				// read panel osc p20
+				// the first length of 20 reading will be treated as osc reading
+				if (!asus_var_osc_reg_feteched && rlen == 20)
+					asus_var_osc_reg_p20_value = return_buf[19];
+			}
+		}
+
+		// 0xA is the idle mode reading command, save it
+		if (cmd == 0xa) {
+			if ( return_buf[0] == 0x5C )
+				asus_var_idle_reg_state = true;
+			else
+				asus_var_idle_reg_state = false;
+			pr_err("[Display] panel power = 0x%02x\n", return_buf[0]);
+		}
+
+		dsi_display_cmd_engine_disable(g_display);
+		goto error_disable_clks;
+	} else {
+		pr_err("[Display] %s: panel is off\n", __func__);
+		dsi_panel_release_panel_lock(panel);
+		return;
+	}
+
+error_disable_clks:
+	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
+	mutex_unlock(&asus_display_cmd_mutex);
+	dsi_panel_release_panel_lock(panel);
+}
+
+void asus_display_set_hbm(int mode, int type)
+{
+	if (!asus_display_panel_valid())
+		return;
+
+	if (mode == g_display->panel->asus_hbm_mode) {
+		pr_err("[Display] mode same, retrun\n");
+		return;
+	}
+
+	// check to exit idle mode
+	asus_display_check_idle_mode(false);
+
+	g_display->panel->asus_hbm_mode = mode;
+	printk("[Display] hbm set to (%d)\n", mode);
+
+	// hbm debug
+	if ( g_display->panel->asus_global_hbm_mode == 1 ){
+		printk("[Display] global_hbm_mode == 1 , return\n");
+		return;
+	}
+
+	dsi_panel_set_hbm(g_display->panel, mode);
+}
+
+void asus_display_set_local_hbm(int enable)
+{
+	printk("[Display] set local hbm to %d\n", enable);
+	if (!g_display) {
+		pr_err("[Display] local hbm could not be set, g_display null\n");
+		return;
+	}
+
+	if (enable) {
+		dsi_panel_set_local_hbm(g_display->panel, true);
+		gpio_set_value(g_display->asus_fod_exi1_gpio, enable);
+		gpio_set_value(g_display->asus_fod_exi2_gpio, enable);
+		g_display->panel->asus_local_hbm_mode = enable;
+	} else {
+		gpio_set_value(g_display->asus_fod_exi1_gpio, enable);
+		gpio_set_value(g_display->asus_fod_exi2_gpio, enable);
+		g_display->panel->asus_local_hbm_mode = enable;
+
+		dsi_panel_set_local_hbm(g_display->panel, false);
+	}
+}
+
+void asus_display_set_panel_aod_bl()
+{
+	if (strncmp(lcd_stage, "2", 1) == 0){ //SR
+		asus_alpm_bl_high = 344;
+		asus_alpm_bl_low = 0;
+	} else if (strncmp(lcd_stage, "3", 1) == 0) { //ER1
+		asus_alpm_bl_high = 344;
+		asus_alpm_bl_low = 0;
+	} else if (strncmp(lcd_stage, "4", 1) == 0) { //ER2
+		asus_alpm_bl_high = 100;
+		asus_alpm_bl_low = 3;
+	} else if (strncmp(lcd_stage, "5", 1) == 0) { //PR
+		asus_alpm_bl_high = 100;
+		asus_alpm_bl_low = 3;
+	} else {
+		asus_alpm_bl_high = 344;
+		asus_alpm_bl_low = 0;
+	}
+}
+
+int dsi_display_asus_dfps(struct dsi_display *display, int type)
+{
+	int rc = 0;
+
+	if (!display || !display->panel) {
+		pr_err("Invalid params\n");
+		return -EINVAL;
+	}
+
+	if (type == 4 && g_display->panel->asus_global_hbm_mode == 1) {
+		printk("[Display] skip fps 160 due to GHBM\n");
+		return rc;
+	}
+
+	mutex_lock(&display->display_lock);
+
+	rc = dsi_panel_asus_switch_fps(display->panel, type);
+	if (rc) {
+		pr_err("[%s] failed to enable DSI panel, rc=%d\n",
+			display->name, rc);
+	}
+	if (type == 4)
+		rc = dsi_display_dynamic_clk_configure_cmd(g_display, 0);
+
+	mutex_unlock(&display->display_lock);
+	return rc;
+}
+
+void asus_display_read_panel_osc(struct dsi_display *display)
+{
+	int rc = 0, rlen = 20;
+	u8 *tx_buf, *return_buf;
+	u32 flags = 0;
+
+	static char bank[2] = {0xB0, 0x04};
+	static char set[5]  = {0xE8, 0x00, 0x00, 0x00, 0x02};
+	static char get     = 0xE4;
+
+	struct dsi_display_ctrl *mctrl;
+	struct dsi_cmd_desc bank_cmd;
+	struct dsi_cmd_desc set_cmd;
+	struct dsi_cmd_desc get_cmd;
+	struct mipi_dsi_msg bank_msg = {0, 0x15, 0, 0, 0, sizeof(bank), bank, 0, NULL};
+	struct mipi_dsi_msg set_msg  = {0, 0x39, 0, 0, 0, sizeof(set), set, 0, NULL};
+	struct mipi_dsi_msg get_msg  = {0, 0x06, 0, 0, 0, sizeof(get), NULL, rlen, NULL};
+
+	if (!display)
+		return;
+
+	mctrl = &display->ctrl[display->cmd_master_idx];
+
+	if (!display->panel || !mctrl || !mctrl->ctrl || !display->panel->dfps_caps.dfps_support)
+		return;
+
+	dsi_panel_acquire_panel_lock(display->panel);
+
+	if (display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON
+			&& asus_display_in_normal_on()) {
+		mutex_lock(&asus_display_cmd_mutex);
+		dsi_display_clk_ctrl(display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
+
+		if (display->tx_cmd_buf == NULL) {
+			rc = dsi_host_alloc_cmd_tx_buffer(display);
+			if (rc) {
+				pr_err("[Display] alloc tx_cmd_buf failed (%d)\n", rc);
+				goto error_disable_clks;
+			}
+		}
+
+		rc = dsi_display_cmd_engine_enable(display);
+		if (rc) {
+			pr_err("[Display] cmd engine enable failed(%d)\n", rc);
+			goto error_disable_clks;
+		}
+
+		// switch to bank 00
+		bank_cmd.msg = bank_msg;
+		bank_cmd.last_command = 1;
+		bank_cmd.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+
+		flags |= DSI_CTRL_CMD_FETCH_MEMORY;
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &bank_cmd.msg, &flags);
+		if (rc)
+			pr_err("[Display] bank_cmd transfer failed, rc=%d\n", rc);
+
+		// set cmd 0xE8
+		set_cmd.msg = set_msg;
+		set_cmd.last_command = 1;
+		set_cmd.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &set_cmd.msg, &flags);
+		if (rc)
+			pr_err("[Display] set_cmd transfer failed, rc=%d\n", rc);
+
+		// get cmd 0xE4
+		tx_buf = &get;
+		return_buf = kcalloc(rlen, sizeof(unsigned char), GFP_KERNEL);
+
+		get_cmd.msg = get_msg;
+		get_cmd.last_command = 1;
+		get_cmd.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+		flags |= DSI_CTRL_CMD_LAST_COMMAND | (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
+
+		get_cmd.msg.tx_buf = tx_buf;
+		get_cmd.msg.rx_buf = return_buf;
+		get_cmd.msg.rx_len = rlen;
+
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &get_cmd.msg, &flags);
+		if (rc <= 0) {
+			printk("[Display] panel osc rx cmd transfer failed rc=%d\n", rc);
+		} else {
+			asus_var_osc_reg_p20_value = return_buf[19];
+			printk("[Display] asus_var_osc_reg_p20_value = 0x%x\n", asus_var_osc_reg_p20_value);
+		}
+
+		rc = dsi_panel_set_osc(display->panel);
+		if (rc)
+			pr_err("failed to send OSC cmds, rc=%d\n", rc);
+
+#if ASUS_RECOVERY_WORKAROUND
+		/*
+		 * Workaround for charger mode and recovery mode flicker
+		 * due to the mini-launchers are not following the TE pin
+		 * there is chance that the first frame does not align to TE and
+		 * screen flickers might happen so we set panel off here to avoid it
+		 *
+		 * But this workaround needs recovery and charger mode to set display
+		 * to unblank. In Obiwan we didn't see this bug, so we disable this
+		 * workaround here.
+		 */
+		if (g_Charger_mode || g_Recovery_mode) {
+			// set dislay off
+			u32 flag = DSI_CTRL_CMD_FETCH_MEMORY;
+			char dispOff[2] = {0x28, 0x00};
+			struct mipi_dsi_msg dispOff_msg = {0, 0x05, 0, 0, 0, sizeof(dispOff), dispOff, 0, NULL};
+			struct dsi_cmd_desc dispOff_cmd;
+			dispOff_cmd.msg = dispOff_msg;
+			dispOff_cmd.last_command = 1;
+			dispOff_cmd.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+
+			rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &dispOff_cmd.msg, &flag);
+			if (rc)
+				pr_err("[Display] set_cmd transfer failed, rc=%d\n", rc);
+			if(g_Charger_mode)
+				msleep(300);
+		}
+#endif
+
+		dsi_display_cmd_engine_disable(display);
+		goto error_disable_clks;
+	} else {
+		pr_err("[Display] %s: panel is off\n", __func__);
+		dsi_panel_release_panel_lock(display->panel);
+		return;
+	}
+
+error_disable_clks:
+	dsi_display_clk_ctrl(display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
+	mutex_unlock(&asus_display_cmd_mutex);
+	dsi_panel_release_panel_lock(display->panel);
+	asus_var_osc_reg_feteched = true;
+}
+
+void asus_display_set_dim_param(int mode, int type)
+{
+	int rc = 0;
+	if (!asus_display_panel_valid())
+		return;
+
+	g_display->panel->asus_dim_mode = mode;
+	pr_err("[Display] bus dim (%d)\n", mode);
+
+	// mode is 0, resend switch code to restore normal state
+	if (mode == 0) {
+		if (asus_current_fps >= 60 && asus_current_fps < 90)
+			rc = dsi_display_asus_dfps(g_display, 2);
+		else if (asus_current_fps >= 90 && asus_current_fps < 120)
+			rc = dsi_display_asus_dfps(g_display, 1);
+		else if (asus_current_fps == 120)
+			rc = dsi_display_asus_dfps(g_display, 0);
+		else if (asus_current_fps == 144)
+			rc = dsi_display_asus_dfps(g_display, 3);
+		else if (asus_current_fps == 160)
+			rc = dsi_display_asus_dfps(g_display, 4);
+	}
+	// mode is 1, update dimming parameter based on current fps
+	else if (mode == 1) {
+		rc = dsi_panel_set_bus_dim(g_display->panel, asus_current_fps);
+	}
+	else {
+		pr_err("[Display] dim mode %d does not match.\n", mode);
+	}
+
+	if (rc)
+		pr_err("[Display] set bus dim mode error [%d]\n", rc);
+}
+
+// set the dimming effect on 2nd backlight
+// they need 1st backlight to be reached ASAP
+void asus_display_set_dimming(u32 cur_bl)
+{
+	static char dimming[2] = {0x53, 0x2C};
+	static int bl_count = 0;
+
+	if (!asus_display_panel_valid())
+		return;
+
+	if (asus_display_in_aod() || cur_bl == 0 ||
+			g_display->panel->asus_global_hbm_pending_mode == 1 ||
+			g_display->panel->asus_hbm_mode == 1) {
+		printk("[Display] do not set dimming in AOD, BL0, GHBM, HBM\n");
+		g_display->panel->asus_bl_delay = 0;
+		bl_count = 0;
+		return;
+	}
+
+	if (bl_count == 1) {
+		asus_display_set_tcon_cmd(dimming, sizeof(dimming), 0);
+
+		// first boot, second backlight only
+		if (asus_blocking_fps_until_bootup) {
+			printk("[Display] first dim, reset fps\n");
+			asus_blocking_fps_until_bootup = false; //reset it along with first backlight dim
+			need_change_fps = true;
+		}
+	}
+
+	dsi_panel_bl_delay(g_display->panel);
+
+	bl_count++;
+}
+
+void asus_display_set_global_hbm(int mode)
+{
+	if (!asus_display_panel_valid())
+		return;
+
+	if (mode == g_display->panel->asus_global_hbm_mode) {
+		pr_err("[Display] global hbm mode same, but do it anyway\n");
+		//return;
+	}
+
+	// check to exit idle mode
+	asus_display_check_idle_mode(false);
+
+	g_display->panel->asus_global_hbm_mode = mode;
+
+	printk("[Display] dimming global hbm (%d)\n", mode);
+	dsi_panel_set_global_hbm(g_display->panel, mode);
+
+	// hbm debug
+	if (mode == 0){
+		printk("[Display] global hbm off, reset hbm mode\n");
+		dsi_panel_set_hbm(g_display->panel, g_display->panel->asus_hbm_mode);
+	}
+}
+
+void asus_display_set_global_hbm_fod(void)
+{
+	if (!asus_display_panel_valid())
+		return;
+
+	if (!g_display->panel->panel_ready_for_cmd) {
+		pr_err("[Display] set global hbm fod, but display is not ready to send command\n");
+		return;
+	}
+
+	// check to exit idle mode
+	asus_display_check_idle_mode(false);
+
+	// FOD and HBM
+	printk("[Display] dimming global hbm <fod> (%d) +++ \n", g_display->panel->asus_global_hbm_pending_mode);
+	dsi_panel_set_global_hbm(g_display->panel, g_display->panel->asus_global_hbm_pending_mode);
+	asus_drm_notify(ASUS_NOTIFY_GHBM_ON_REQ, g_display->panel->asus_global_hbm_pending_mode);
+	printk("[Display] dimming global hbm <fod> (%d) --- \n", g_display->panel->asus_global_hbm_pending_mode);
+
+	// reset pending immediately, need be guard by lock
+	asus_var_global_hbm_pending = false;
+}
+
+#if ASUS_RECOVERY_WORKAROUND
+void set_panel_in_recovery(void)
+{
+	queue_delayed_work(asus_display_wq, &asus_display_recovery_mode_work, msecs_to_jiffies(50));
+}
+
+static void asus_display_recovery_mode_workfunc(struct work_struct *ws)
+{
+	int rc = 0;
+	u32 flags;
+
+	static char dispOn[2] = {0x29, 0x00};
+
+	struct dsi_display_ctrl *mctrl;
+	struct dsi_cmd_desc dispOn_cmd;
+	struct mipi_dsi_msg dispOn_msg = {0, 0x05, 0, 0, 0, sizeof(dispOn), dispOn, 0, NULL};
+
+	if (!asus_display_panel_valid())
+		return;
+
+	mctrl = &g_display->ctrl[g_display->cmd_master_idx];
+
+	if (!mctrl || !mctrl->ctrl || !g_display->panel->dfps_caps.dfps_support || !g_Recovery_mode)
+		return;
+
+	dsi_panel_acquire_panel_lock(g_display->panel);
+
+	if (g_display->ctrl[0].ctrl->current_state.controller_state == DSI_CTRL_ENGINE_ON  
+			&& !asus_display_in_normal_off()) {
+		mutex_lock(&asus_display_cmd_mutex);
+		dsi_display_clk_ctrl(g_display->dsi_clk_handle, DSI_ALL_CLKS, DSI_CLK_ON);
+
+		if (g_display->tx_cmd_buf == NULL) {
+			rc = dsi_host_alloc_cmd_tx_buffer(g_display);
+			if (rc) {
+				pr_err("[Display] alloc tx_cmd_buf failed (%d)\n", rc);
+				goto error_disable_clks;
+			}
+		}
+
+		rc = dsi_display_cmd_engine_enable(g_display);
+		if (rc) {
+			pr_err("[Display] cmd engine enable failed(%d)\n", rc);
+			goto error_disable_clks;
+		}
+
+		dispOn_cmd.msg = dispOn_msg;
+		dispOn_cmd.last_command = 1;
+		dispOn_cmd.msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+
+		flags = DSI_CTRL_CMD_FETCH_MEMORY;
+		rc = dsi_ctrl_cmd_transfer(mctrl->ctrl, &dispOn_cmd.msg, &flags);
+		if (rc)
+			pr_err("[Display] set_cmd transfer failed, rc=%d\n", rc);
+
+		dsi_display_cmd_engine_disable(g_display);
+		goto error_disable_clks;
+	} else {
+		pr_err("[Display] %s: panel is off\n", __func__);
+		dsi_panel_release_panel_lock(g_display->panel);
+		return;
+	}
+
+error_disable_clks:
+	dsi_display_clk_ctrl(g_display->dsi_clk_handle,DSI_ALL_CLKS, DSI_CLK_OFF);
+	mutex_unlock(&asus_display_cmd_mutex);
+	dsi_panel_release_panel_lock(g_display->panel);
+}
+#endif
+
+//
+// ASUS display proc file declarations
+//
+static ssize_t asus_display_proc_reg_rw(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char *messages, *tmp, *cur;
+	char *token, *token_par;
+	char *put_cmd;
+	bool flag = 0; /* w/r type : w=1, r=0 */
+	int *store;
+	int i = 0, cnt = 0, cmd_cnt = 0;
+	int ret = 0;
+	uint8_t str_len = 0;
+
+	messages = (char*) kmalloc(len*sizeof(char), GFP_KERNEL);
+	if(!messages)
+		return -EFAULT;
+
+	tmp = (char*) kmalloc(len*sizeof(char), GFP_KERNEL);
+	memset(tmp, 0, len*sizeof(char));
+	store =  (int*) kmalloc((len/MIN_LEN)*sizeof(int), GFP_KERNEL);
+	put_cmd = (char*) kmalloc((len/MIN_LEN)*sizeof(char), GFP_KERNEL);
+	memset(asus_var_reg_buffer, 0, REG_BUF_SIZE*sizeof(char));
+
+	/* add '\0' to end of string */
+	if (copy_from_user(messages, buff, len)) {
+		ret = -1;
+		goto error;
+	}
+
+	cur = messages;
+	*(cur+len-1) = '\0';
+	pr_err("[Display] %s (%s) +++\n", __func__, cur);
+
+	if (strncmp(cur, "w", 1) == 0)
+		flag = true;
+	else if(strncmp(cur, "r", 1) == 0)
+		flag = false;
+	else {
+		ret = -1;
+		goto error;
+	}
+
+	while ((token = strsep(&cur, "wr")) != NULL) {
+		str_len = strlen(token);
+
+		if(str_len > 0) { /* filter zero length */
+			if(!(strncmp(token, ",", 1) == 0) || (str_len < MAX_LEN)) {
+				ret = -1;
+				goto error;
+			}
+
+			memset(store, 0, (len/MIN_LEN)*sizeof(int));
+			memset(put_cmd, 0, (len/MIN_LEN)*sizeof(char));
+			cmd_cnt++;
+
+			/* register parameter */
+			while ((token_par = strsep(&token, ",")) != NULL) {
+				if(strlen(token_par) > MIN_LEN) {
+					ret = -1;
+					goto error;
+				}
+				if(strlen(token_par)) {
+					sscanf(token_par, "%x", &(store[cnt]));
+					cnt++;
+				}
+			}
+
+			for(i=0; i<cnt; i++)
+				put_cmd[i] = store[i]&0xff;
+
+			if(flag) {
+				pr_err("[Display] write panel command\n");
+				asus_display_set_tcon_cmd(put_cmd, cnt, 0);
+			}
+			else {
+				pr_err("[Display] read panel command\n");
+				asus_display_get_tcon_cmd(put_cmd[0], store[1]);
+			}
+
+			if(cur != NULL) {
+				if (*(tmp+str_len) == 'w')
+					flag = true;
+				else if (*(tmp+str_len) == 'r')
+					flag = false;
+			}
+			cnt = 0;
+		}
+
+		memset(tmp, 0, len*sizeof(char));
+
+		if(cur != NULL)
+			strcpy(tmp, cur);
+	}
+
+	if(cmd_cnt == 0) {
+		ret = -1;
+		goto error;
+	}
+
+	ret = len;
+
+error:
+	pr_err("[Display] %s(%d) ---\n", __func__, ret);
+	kfree(messages);
+	kfree(tmp);
+	kfree(store);
+	kfree(put_cmd);
+	return ret;
+}
+
+static ssize_t asus_display_proc_reg_result_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(SZ_4K, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%s\n", asus_var_reg_buffer);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_reg_rw_ops = {
+	.write = asus_display_proc_reg_rw,
+	.read = asus_display_proc_reg_result_read,
+};
+
+static ssize_t asus_display_proc_unique_id_read(struct file *file, char __user *buf, 
+				size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(256, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%s\n", asus_var_panel_unique_id);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_unique_id_ops = {
+	.read = asus_display_proc_unique_id_read,
+};
+
+static ssize_t asus_display_proc_bl_delay_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_panel_valid())
+		return -EFAULT;
+
+	g_display->panel->asus_bl_delay = display_atoi(messages);
+	printk("[Display] write bl delay to %d\n", g_display->panel->asus_bl_delay);
+
+	return len;
+}
+
+static ssize_t asus_display_proc_bl_delay_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EFAULT;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[Display] read bl delay is %d\n", g_display->panel->asus_bl_delay);
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_bl_delay);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_bl_delay_ops = {
+	.write = asus_display_proc_bl_delay_write,
+	.read  = asus_display_proc_bl_delay_read,
+};
+
+static ssize_t asus_display_proc_hbm_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_panel_valid())
+		return -EFAULT;
+
+	pr_err("[Display] hbm write +++ \n");
+
+	if (!asus_display_in_normal_off()) {
+		if (strncmp(messages, "0", 1) == 0) {
+			asus_display_set_hbm(0, 0);
+		} else if (strncmp(messages, "1", 1) == 0) {
+			asus_display_set_hbm(1, 0);
+		} else {
+			pr_err("[Display] don't match any hbm mode.\n");
+		}
+	} else {
+		pr_err("[Display] unable to set in display off\n");
+		g_display->panel->asus_hbm_mode = 0;
+	}
+
+	pr_err("[Display] hbm write --- \n");
+
+	return len;
+}
+
+static ssize_t asus_display_proc_hbm_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	if (!asus_display_panel_valid())
+		return -EFAULT;
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_hbm_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_hbm_ops = {
+	.write = asus_display_proc_hbm_write,
+	.read  = asus_display_proc_hbm_read,
+};
+
+static ssize_t asus_display_proc_dim_param_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_in_normal_off()) {
+		if (strncmp(messages, "0", 1) == 0) {
+			asus_display_set_dim_param(0, 0);
+		} else if (strncmp(messages, "1", 1) == 0) {
+			asus_display_set_dim_param(1, 0);
+		} else if (strncmp(messages, "2", 1) == 0) {
+			asus_display_set_dim_param(2, 0);
+		} else if (strncmp(messages, "3", 1) == 0) {
+			asus_display_set_dim_param(3, 0);
+		} else {
+			pr_err("[Display] don't match any dim mode.\n");
+		}
+	} else {
+		pr_err("[Display] unable to set.\n");
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_dim_param_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[Display] dim mode is %d\n", g_display->panel->asus_dim_mode);
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_dim_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_dim_param_ops = {
+	.write = asus_display_proc_dim_param_write,
+	.read  = asus_display_proc_dim_param_read,
+};
+
+static ssize_t asus_display_proc_lcd_stage_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(256, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	if (strncmp(asus_var_panel_stage, "B0", 2) == 0)
+		snprintf(lcd_stage, 10, "%s", "2"); //SR
+	else if (strncmp(asus_var_panel_stage, "B1", 2) == 0)
+		snprintf(lcd_stage, 10, "%s", "3"); //ER1
+	else if (strncmp(asus_var_panel_stage, "B2", 2) == 0)
+		snprintf(lcd_stage, 10, "%s", "4"); //ER2
+	else if (strncmp(asus_var_panel_stage, "B3", 2) == 0)
+		snprintf(lcd_stage, 10, "%s", "5"); //PR
+	else
+		snprintf(lcd_stage, 10, "%s", "Yoda"); //Yoda
+
+	len += sprintf(buff, "%s\n", lcd_stage);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_lcd_stage_ops = {
+	.read = asus_display_proc_lcd_stage_read,
+};
+
+static ssize_t asus_display_proc_initial_command_version_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+	char text[64];
+
+	buff = kzalloc(64, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	snprintf(text, 64, "version: %s\ndescription: %s", g_display->panel->asus_initial_code_version,
+				g_display->panel->asus_initial_code_description);
+
+	len += sprintf(buff, "%s\n", text);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_initial_command_version_ops = {
+	.read = asus_display_proc_initial_command_version_read,
+};
+
+
+void hbm_on(int on)
+{
+	g_display->panel->asus_global_hbm_pending_mode = on;
+	asus_var_global_hbm_pending = true;
+}
+
+static ssize_t asus_display_proc_global_hbm_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_in_normal_off()) {
+		if (strncmp(messages, "0", 1) == 0) {
+			asus_display_set_global_hbm(0);
+		} else if (strncmp(messages, "1", 1) == 0) {
+			asus_display_set_global_hbm(1);
+		} else {
+			pr_err("[Display] don't match any hbm mode.\n");
+		}
+	} else {
+		pr_err("[Display] unable to set global hbm in normal off mode\n");
+		if (asus_display_panel_valid())
+			g_display->panel->asus_global_hbm_mode = 0;
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_global_hbm_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[Display] global_hbm mode is %d\n", g_display->panel->asus_global_hbm_mode);
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_global_hbm_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_global_hbm_ops = {
+	.write = asus_display_proc_global_hbm_write,
+	.read  = asus_display_proc_global_hbm_read,
+};
+
+static ssize_t asus_display_proc_global_hbm_fod_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (strncmp(messages, "0", 1) == 0) {
+		pr_err("[Display] record global hbm 0, pending...\n");
+		g_display->panel->asus_global_hbm_pending_mode = 0;
+		asus_var_global_hbm_pending = true;
+	} else if (strncmp(messages, "1", 1) == 0) {
+		pr_err("[Display] record global hbm 1, pending...\n");
+		g_display->panel->asus_global_hbm_pending_mode = 1;
+		asus_var_global_hbm_pending = true;
+	} else {
+		pr_err("[Display] don't match any hbm mode.\n");
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_global_hbm_fod_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[Display] global_hbm mode is %d\n", g_display->panel->asus_global_hbm_mode);
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_global_hbm_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_global_hbm_fod_ops = {
+	.write = asus_display_proc_global_hbm_fod_write,
+	.read  = asus_display_proc_global_hbm_fod_read,
+};
+
+static ssize_t asus_display_proc_local_hbm_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	if (!asus_display_in_normal_off()) {
+		if (strncmp(messages, "0", 1) == 0) {
+			asus_display_set_local_hbm(0);
+		} else if (strncmp(messages, "1", 1) == 0) {
+			asus_display_set_local_hbm(1);
+		} else {
+			pr_err("[Display] don't match any hbm mode.\n");
+		}
+	} else {
+		pr_err("[Display] unable to set local hbm mode in off mode.\n");
+		g_display->panel->asus_local_hbm_mode = 0;
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_local_hbm_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[Display] local hbm mode is %d\n", g_display->panel->asus_local_hbm_mode);
+
+	len += sprintf(buff, "%d\n", g_display->panel->asus_local_hbm_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_local_hbm_ops = {
+	.write = asus_display_proc_local_hbm_write,
+	.read  = asus_display_proc_local_hbm_read,
+};
+
+static ssize_t asus_display_proc_always_on_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	if (strncmp(messages, "0", 1) == 0) {
+		asus_var_regulator_always_on = false;
+	} else if (strncmp(messages, "1", 1) == 0) {
+		asus_var_regulator_always_on = true;
+	} else {
+		pr_err("[Display] don't match any hbm mode.\n");
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_always_on_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "Regulator Always On: %s\n", (asus_var_regulator_always_on ? "YES" : "NO"));
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_always_on_ops = {
+	.write = asus_display_proc_always_on_write,
+	.read  = asus_display_proc_always_on_read,
+};
+
+static ssize_t asus_display_proc_fps_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	int fps_wanted = 120;
+	int type = 0;
+
+	memset(messages, 0, sizeof(messages));
+
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	if (strncmp(messages, "160", 3) == 0) {
+		fps_wanted = 160;
+		type = 4;
+	} else if (strncmp(messages, "144", 3) == 0) {
+		fps_wanted = 144;
+		type = 3;
+	} else if (strncmp(messages, "120", 3) == 0) {
+		fps_wanted = 120;
+		type = 0;
+	} else if (strncmp(messages, "90", 2) == 0) {
+		fps_wanted = 90;
+		type = 1;
+	} else if (strncmp(messages, "60", 2) == 0) {
+		fps_wanted = 60;
+		type = 2;
+	} else if (strncmp(messages, "0", 1) == 0) {
+		asus_fps_overriding = false;
+		fps_wanted = 90;
+		return len;
+	} else {
+		pr_err("[Display] don't match any avaiable fps.\n");
+		return -EINVAL;
+	}
+
+	if (fps_wanted == asus_current_fps) {
+		pr_err("[Display] skip fps change, already is fps %d\n", fps_wanted);
+	} else {
+		pr_err("[Display] changing fps to %d\n", fps_wanted);
+		//need_change_fps = true;
+		asus_current_fps = fps_wanted;
+		dsi_panel_asus_switch_fps(g_display->panel, type);
+		asus_fps_overriding = true;
+	}
+
+	return len;
+}
+
+static ssize_t asus_display_proc_fps_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%d\n", asus_current_fps);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_fps_ops = {
+	.write = asus_display_proc_fps_write,
+	.read  = asus_display_proc_fps_read,
+};
+
+/*
+ * Global HBM on off delay utils
+ */
+int asus_display_find_fps_index(int fps) {
+	int i = 0;
+	for(i = 0; i < 5; i++) {
+		if (asus_var_hbm_fps_list[i] == fps)
+			return i;
+	}
+	pr_err("[Display] finding fps %d error\n", fps);
+	return 0;
+}
+
+int asus_display_get_global_hbm_delay(bool on)
+{
+	int ret = 53;
+	int index = asus_display_find_fps_index(asus_current_fps);
+	if (on) {
+		ret = asus_var_hbm_on_delay[index];
+	} else {
+		if (!asus_display_in_aod())
+			ret = asus_var_hbm_off_delay[index];
+		else
+			ret = asus_var_hbm_off_delay_aod[index];
+	}
+	return ret;
+}
+
+void asus_display_set_global_hbm_delay(bool on, int value)
+{
+	int index = asus_display_find_fps_index(asus_current_fps);
+	if (on) {
+		asus_var_hbm_on_delay[index] = value;
+	} else {
+		if (!asus_display_in_aod())
+			asus_var_hbm_off_delay[index] = value;
+		else
+			asus_var_hbm_off_delay_aod[index] = value;
+	}
+}
+
+static ssize_t asus_display_proc_hbm_on_delay_write(struct file *file,
+				  const char __user *user_buf,
+				  size_t user_len,
+				  loff_t *ppos)
+{
+	char *buf;
+	int rc = 0;
+	size_t len;
+	unsigned int new_delay;
+
+	if (*ppos)
+		return 0;
+
+	buf = kzalloc(MISR_BUFF_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	/* leave room for termination char */
+	len = min_t(size_t, user_len, MISR_BUFF_SIZE - 1);
+	if (copy_from_user(buf, user_buf, len)) {
+		rc = -EINVAL;
+		goto error;
+	}
+
+	buf[len] = '\0'; /* terminate the string */
+
+	if (sscanf(buf, "%d", &new_delay) != 1) {
+		rc = -EINVAL;
+		goto error;
+	}
+	asus_display_set_global_hbm_delay(true, new_delay);
+	rc = user_len;
+
+error:
+	kfree(buf);
+	return rc;
+}
+
+static ssize_t asus_display_proc_hbm_on_delay_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%d\n", asus_display_get_global_hbm_delay(true));
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+	return ret;
+}
+
+static struct file_operations asus_display_proc_hbm_on_delay_ops = {
+	.write = asus_display_proc_hbm_on_delay_write,
+	.read  = asus_display_proc_hbm_on_delay_read,
+};
+
+/////////////////////////
+// HBM OFF DELAY
+static ssize_t asus_display_proc_hbm_off_delay_write(struct file *file,
+				  const char __user *user_buf,
+				  size_t user_len,
+				  loff_t *ppos)
+{
+	char *buf;
+	int rc = 0;
+	size_t len;
+	unsigned int new_delay;
+
+	if (*ppos)
+		return 0;
+
+	buf = kzalloc(MISR_BUFF_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	/* leave room for termination char */
+	len = min_t(size_t, user_len, MISR_BUFF_SIZE - 1);
+	if (copy_from_user(buf, user_buf, len)) {
+		rc = -EINVAL;
+		goto error;
+	}
+
+	buf[len] = '\0'; /* terminate the string */
+
+	if (sscanf(buf, "%d", &new_delay) != 1) {
+		rc = -EINVAL;
+		goto error;
+	}
+	asus_display_set_global_hbm_delay(false, new_delay);
+	rc = user_len;
+
+error:
+	kfree(buf);
+	return rc;
+}
+
+static ssize_t asus_display_proc_hbm_off_delay_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%d\n", asus_display_get_global_hbm_delay(false));
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+	return ret;
+}
+
+static struct file_operations asus_display_proc_hbm_off_delay_ops = {
+	.write = asus_display_proc_hbm_off_delay_write,
+	.read  = asus_display_proc_hbm_off_delay_read,
+};
+
+
+static ssize_t asus_display_proc_power_mode_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	if (!asus_display_panel_valid())
+		return -EINVAL;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	len += sprintf(buff, "%d\n", g_display->panel->power_mode);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_power_mode_ops = {
+	.read  = asus_display_proc_power_mode_read,
+};
+/* ASUS BSP Display --- */
+
+/* ASUS HDCP +++*/
+static ssize_t asus_display_proc_hdcp_version_write(struct file *filp, const char *buff, size_t len, loff_t *off)
+{
+	char messages[256];
+	memset(messages, 0, sizeof(messages));
+	printk("[Display] hdcp_version write +++ \n");
+	if (len > 256)
+		len = 256;
+	if (copy_from_user(messages, buff, len))
+		return -EFAULT;
+
+	if (strncmp(messages, "0", 1) == 0) {
+		printk("[Display] hdcp_version set to HDCP2.2\n");
+		g_hdcp_version = 0;
+	} else if (strncmp(messages, "1", 1) == 0) {
+		printk("[Display] hdcp_version set to HDCP2.3\n");
+		g_hdcp_version = 1;
+	} else {
+		pr_err("[HDCP] don't match any hdcp version.\n");
+	}
+	printk("[Display] hdcp_version write --- \n");
+	return len;
+}
+
+static ssize_t asus_display_proc_hdcp_version_read(struct file *file, char __user *buf,
+							 size_t count, loff_t *ppos)
+{
+	int len = 0;
+	ssize_t ret = 0;
+	char *buff;
+
+	buff = kzalloc(100, GFP_KERNEL);
+	if (!buff)
+		return -ENOMEM;
+
+	printk("[HDCP] hdcp version is %d\n", g_hdcp_version);
+
+	len += sprintf(buff, "%d\n", g_hdcp_version);
+	ret = simple_read_from_buffer(buf, count, ppos, buff, len);
+	kfree(buff);
+
+	return ret;
+}
+
+static struct file_operations asus_display_proc_hdcp_version_ops = {
+	.write = asus_display_proc_hdcp_version_write,
+	.read  = asus_display_proc_hdcp_version_read,
+};
+/* ASUS HDCP ---*/
 
 static int dsi_display_validate_split_link(struct dsi_display *display)
 {
@@ -5922,7 +6950,7 @@ static int dsi_display_bind(struct device *dev,
 				drm, display);
 		return -EINVAL;
 	}
-	if (!display->panel_node && !display->fw)
+	if (!display->panel_node)
 		return 0;
 
 	if (!display->fw)
@@ -6093,17 +7121,30 @@ static int dsi_display_bind(struct device *dev,
 	/* register te irq handler */
 	dsi_display_register_te_irq(display);
 
+	/* ASUS BSP Display +++ */
 	g_display = display;
 	mutex_init(&asus_display_cmd_mutex);
-
+	proc_create(LCD_REGISTER_RW, 0666, NULL, &asus_display_proc_reg_rw_ops);
 	proc_create(LCD_UNIQUE_ID, 0444, NULL, &asus_display_proc_unique_id_ops);
-	proc_create(LCD_REGISTER_RW, 0640, NULL, &asus_display_proc_reg_rw_ops);
-	proc_create(LCD_FPS, 0666, NULL, &asus_display_proc_fps_ops);
-	proc_create(LCD_STAGE, 0666, NULL, &asus_display_proc_lcd_stage_ops);
+	proc_create(DISPLAY_BACKLIGHT_DELAY, 0666, NULL, &asus_display_proc_bl_delay_ops);
 	proc_create(HBM_MODE, 0666, NULL, &asus_display_proc_hbm_ops);
-	proc_create(DIMMING_SPEED, 0666, NULL, &asus_display_proc_dimming_speed_ops);
-	proc_create(LCD_BACKLIGNTNESS, 0666, NULL, &asus_display_proc_lcd_brightness_ops);
-	
+	proc_create(LCD_STAGE, 0666, NULL, &asus_display_proc_lcd_stage_ops);
+	proc_create(LOCAL_HBM_MODE, 0666, NULL, &asus_display_proc_local_hbm_ops);
+	proc_create(LCD_REG_AWS_ON, 0666, NULL, &asus_display_proc_always_on_ops);
+	proc_create(LCD_FPS, 0666, NULL, &asus_display_proc_fps_ops);
+	proc_create(LCD_POWER_MODE, 0666, NULL, &asus_display_proc_power_mode_ops);
+	proc_create(DIM_MODE, 0666, NULL, &asus_display_proc_dim_param_ops);
+	proc_create(GLOBAL_HBM_MODE, 0666, NULL, &asus_display_proc_global_hbm_ops);
+	proc_create(GLOBAL_HBM_FOD_MODE, 0666, NULL, &asus_display_proc_global_hbm_fod_ops);
+	proc_create(HBM_MODE_ON_DELAY, 0666, NULL, &asus_display_proc_hbm_on_delay_ops);
+	proc_create(HBM_MODE_OFF_DELAY, 0666, NULL, &asus_display_proc_hbm_off_delay_ops);
+	proc_create(INITIAL_CODE_VERSION, 0666, NULL, &asus_display_proc_initial_command_version_ops);
+	/* ASUS HDCP */
+	proc_create(HDCP_VERSION, 0666, NULL, &asus_display_proc_hdcp_version_ops);
+
+	asus_display_wq = create_workqueue("asus_lcd_wq");
+	/* ASUS BSP Display --- */
+
 	goto error;
 
 error_host_deinit:
@@ -6230,13 +7271,7 @@ static void dsi_display_firmware_display(const struct firmware *fw,
 			fw->size);
 
 		display->fw = fw;
-
-		if (!strcmp(display->display_type, "primary"))
-			display->name = "dsi_firmware_display";
-
-		else if (!strcmp(display->display_type, "secondary"))
-			display->name = "dsi_firmware_display_secondary";
-
+		display->name = "dsi_firmware_display";
 	} else {
 		DSI_INFO("no firmware available, fallback to device node\n");
 	}
@@ -6317,17 +7352,10 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 
 	/* initialize display in firmware callback */
 	if (!boot_disp->boot_disp_en && IS_ENABLED(CONFIG_DSI_PARSER)) {
-		if (!strcmp(display->display_type, "primary"))
-			firm_req = !request_firmware_nowait(
-				THIS_MODULE, 1, "dsi_prop",
-				&pdev->dev, GFP_KERNEL, display,
-				dsi_display_firmware_display);
-
-		else if (!strcmp(display->display_type, "secondary"))
-			firm_req = !request_firmware_nowait(
-				THIS_MODULE, 1, "dsi_prop_sec",
-				&pdev->dev, GFP_KERNEL, display,
-				dsi_display_firmware_display);
+		firm_req = !request_firmware_nowait(
+			THIS_MODULE, 1, "dsi_prop",
+			&pdev->dev, GFP_KERNEL, display,
+			dsi_display_firmware_display);
 	}
 
 	if (!firm_req) {
@@ -6386,8 +7414,7 @@ int dsi_display_get_num_of_displays(void)
 	for (i = 0; i < MAX_DSI_ACTIVE_DISPLAY; i++) {
 		struct dsi_display *display = boot_displays[i].disp;
 
-		if ((display && display->panel_node) ||
-					(display && display->fw))
+		if (display && display->panel_node)
 			count++;
 	}
 
@@ -6406,8 +7433,7 @@ int dsi_display_get_active_displays(void **display_array, u32 max_display_count)
 	for (index = 0; index < MAX_DSI_ACTIVE_DISPLAY; index++) {
 		struct dsi_display *display = boot_displays[index].disp;
 
-		if ((display && display->panel_node) ||
-					(display && display->fw))
+		if (display && display->panel_node)
 			display_array[count++] = display;
 	}
 
@@ -6958,10 +7984,7 @@ int dsi_display_get_info(struct drm_connector *connector,
 	info->max_width = 1920;
 	info->max_height = 1080;
 	info->qsync_min_fps =
-		display->panel->qsync_caps.qsync_min_fps;
-	info->has_qsync_min_fps_list =
-		(display->panel->qsync_caps.qsync_min_fps_list_len > 0) ?
-		true : false;
+		display->panel->qsync_min_fps;
 
 	switch (display->panel->panel_mode) {
 	case DSI_OP_VIDEO_MODE:
@@ -7023,11 +8046,11 @@ void dsi_display_adjust_mode_timing(struct dsi_display *display,
 	u32 bits_per_symbol = 16, num_of_symbols = 7; /* For Cphy */
 
 	dyn_clk_caps = &(display->panel->dyn_clk_caps);
-
+#if 0 /* ASUS BSP */
 	/* Constant FPS is not supported on command mode */
 	if (dsi_mode->panel_mode == DSI_OP_CMD_MODE)
 		return;
-
+#endif
 	if (!dyn_clk_caps->maintain_const_fps)
 		return;
 	/*
@@ -7201,23 +8224,18 @@ int dsi_display_get_modes(struct dsi_display *display,
 
 	dyn_clk_caps = &(display->panel->dyn_clk_caps);
 
-	timing_mode_count = display->panel->num_timing_nodes;
+	num_dfps_rates = !dfps_caps.dfps_support ? 1 : dfps_caps.dfps_list_len;
 
-	/* Validate command line timing */
-	if ((display->cmdline_timing != NO_OVERRIDE) &&
-		(display->cmdline_timing >= timing_mode_count))
-		display->cmdline_timing = NO_OVERRIDE;
+	timing_mode_count = display->panel->num_timing_nodes;
+	pr_err("[Display] num dfps %d, num timing %d\n", num_dfps_rates, timing_mode_count);
 
 	for (mode_idx = 0; mode_idx < timing_mode_count; mode_idx++) {
 		struct dsi_display_mode display_mode;
 		int topology_override = NO_OVERRIDE;
-		//bool is_preferred = false; //Lotta_Lu  support dynamic fps switch
 		u32 frame_threshold_us = ctrl->ctrl->frame_threshold_time_us;
 
-		if (display->cmdline_timing == mode_idx) {
+		if (display->cmdline_timing == mode_idx)
 			topology_override = display->cmdline_topology;
-			//is_preferred = true; //Lotta_Lu  support dynamic fps switch
-		}
 
 		memset(&display_mode, 0, sizeof(display_mode));
 
@@ -7229,14 +8247,10 @@ int dsi_display_get_modes(struct dsi_display *display,
 				   display->name, mode_idx);
 			goto error;
 		}
+		pr_err("[Display] mode %d, has refresh rate of %d, tx %d\n",
+				mode_idx, display_mode.timing.refresh_rate, display_mode.timing.dsi_transfer_time_us);
 
 		is_cmd_mode = (display_mode.panel_mode == DSI_OP_CMD_MODE);
-
-		//Lotta_Lu  support dynamic fps switch
-		//num_dfps_rates = ((!dfps_caps.dfps_support ||
-        //               is_cmd_mode) ? 1 : dfps_caps.dfps_list_len);
-
-		num_dfps_rates = ((!dfps_caps.dfps_support ) ? 1 : dfps_caps.dfps_list_len); 
 
 		/* Calculate dsi frame transfer time */
 		if (is_cmd_mode) {
@@ -7278,6 +8292,8 @@ int dsi_display_get_modes(struct dsi_display *display,
 			struct dsi_display_mode *sub_mode =
 					&display->modes[array_idx];
 			u32 curr_refresh_rate;
+			int max_fps = 144; //all rate based on 144 fps
+			u64 boost_panel_clock_rate_hz = 860000000;
 
 			if (!sub_mode) {
 				DSI_ERR("invalid mode data\n");
@@ -7288,34 +8304,55 @@ int dsi_display_get_modes(struct dsi_display *display,
 			memcpy(sub_mode, &display_mode, sizeof(display_mode));
 			array_idx++;
 
-			//Lotta_Lu  support dynamic fps switch
-			//if (!dfps_caps.dfps_support || is_cmd_mode)
-			if (!dfps_caps.dfps_support )
+			if (!dfps_caps.dfps_support)
 				continue;
 
 			curr_refresh_rate = sub_mode->timing.refresh_rate;
 			sub_mode->timing.refresh_rate = dfps_caps.dfps_list[i];
+			printk("[Display] (original) timing.refresh_rate = %d", sub_mode->timing.refresh_rate);
 
 			dsi_display_get_dfps_timing(display, sub_mode,
 					curr_refresh_rate);
+
+			printk("[Display] (original) timing.clk_rate_hz = %lld, timing.min_dsi_clk_hz = %lld, pixel_clk_khz = %lld\n",
+					sub_mode->timing.clk_rate_hz, sub_mode->timing.min_dsi_clk_hz, sub_mode->pixel_clk_khz);
+
+			if (g_display) {
+				if (g_display->panel->asus_boost_panel_clock_rate_hz > 0)
+					boost_panel_clock_rate_hz = g_display->panel->asus_boost_panel_clock_rate_hz;
+			}
+
+			// adjust mode attributes on each frame rate
+			if (sub_mode->timing.refresh_rate > max_fps) {
+				sub_mode->timing.clk_rate_hz    = boost_panel_clock_rate_hz;
+				sub_mode->timing.min_dsi_clk_hz = 848796375;
+				sub_mode->pixel_clk_khz         = 143236;
+
+				sub_mode->priv_info->min_dsi_clk_hz = sub_mode->priv_info->min_dsi_clk_hz;
+				sub_mode->priv_info->dsi_transfer_time_us = sub_mode->priv_info->dsi_transfer_time_us;
+				sub_mode->priv_info->mdp_transfer_time_us = sub_mode->priv_info->mdp_transfer_time_us;
+			} else {
+				sub_mode->timing.clk_rate_hz = (sub_mode->timing.clk_rate_hz / max_fps) * sub_mode->timing.refresh_rate;
+				sub_mode->timing.min_dsi_clk_hz = (sub_mode->timing.min_dsi_clk_hz / max_fps) * sub_mode->timing.refresh_rate;
+				sub_mode->pixel_clk_khz = (sub_mode->pixel_clk_khz / max_fps) * sub_mode->timing.refresh_rate;
+
+				sub_mode->priv_info->min_dsi_clk_hz = (sub_mode->priv_info->min_dsi_clk_hz / max_fps) * sub_mode->timing.refresh_rate;
+				sub_mode->priv_info->dsi_transfer_time_us = sub_mode->priv_info->dsi_transfer_time_us * max_fps / sub_mode->timing.refresh_rate;
+				sub_mode->priv_info->mdp_transfer_time_us = sub_mode->priv_info->mdp_transfer_time_us * max_fps / sub_mode->timing.refresh_rate;
+			}
+
+			printk("[Display] (adjusted) timing.clk_rate_hz = %lld, timing.min_dsi_clk_hz = %lld, pixel_clk_khz = %lld\n",
+					sub_mode->timing.clk_rate_hz, sub_mode->timing.min_dsi_clk_hz, sub_mode->pixel_clk_khz);
+			printk("[Display] (adjusted) priv_info->min_dsi_clk_hz = %lld\n",
+					sub_mode->priv_info->min_dsi_clk_hz);
+
 		}
 		end = array_idx;
 		/*
-		 * if POMS is enabled and boot up mode is video mode,
-		 * skip bit clk rates update for command mode,
-		 * else if dynamic clk switch is supported then update all
-		 * the bit clk rates.
+		 * if dynamic clk switch is supported then update all the bit
+		 * clk rates.
 		 */
-
-		/*if (is_cmd_mode &&  //Lotta_Lu  support dynamic fps switch
-			(display->panel->panel_mode == DSI_OP_VIDEO_MODE))
-			continue;*/
-
 		_dsi_display_populate_bit_clks(display, start, end, &array_idx);
-	//	if (is_preferred) {  //Lotta_Lu  support dynamic fps switch
-			/* Set first timing sub mode as preferred mode */
-	//		display->modes[start].is_preferred = true;
-	//	}
 	}
 
 exit:
@@ -7411,25 +8448,6 @@ int dsi_display_get_default_lms(void *dsi_display, u32 *num_lm)
 	return rc;
 }
 
-int dsi_display_get_qsync_min_fps(void *display_dsi, u32 mode_fps)
-{
-	struct dsi_display *display = (struct dsi_display *)display_dsi;
-	struct dsi_panel *panel;
-	u32 i;
-
-	if (display == NULL || display->panel == NULL)
-		return -EINVAL;
-
-	panel = display->panel;
-	for (i = 0; i < panel->dfps_caps.dfps_list_len; i++) {
-		if (panel->dfps_caps.dfps_list[i] == mode_fps)
-			return panel->qsync_caps.qsync_min_fps_list[i];
-	}
-	SDE_EVT32(mode_fps);
-	DSI_DEBUG("Invalid mode_fps %d\n", mode_fps);
-	return -EINVAL;
-}
-
 int dsi_display_find_mode(struct dsi_display *display,
 		const struct dsi_display_mode *cmp,
 		struct dsi_display_mode **out_mode)
@@ -7458,11 +8476,7 @@ int dsi_display_find_mode(struct dsi_display *display,
 	for (i = 0; i < count; i++) {
 		struct dsi_display_mode *m = &display->modes[i];
 
-		if (cmp->timing.v_active == m->timing.v_active &&
-			cmp->timing.h_active == m->timing.h_active &&
-			cmp->timing.refresh_rate == m->timing.refresh_rate &&
-			cmp->panel_mode == m->panel_mode &&
-			cmp->pixel_clk_khz == m->pixel_clk_khz) {
+		if (cmp->timing.refresh_rate == m->timing.refresh_rate) {
 			*out_mode = m;
 			rc = 0;
 			break;
@@ -7536,14 +8550,13 @@ int dsi_display_validate_mode_change(struct dsi_display *display,
 			if (dfps_caps.dfps_support ||
 				dyn_clk_caps->maintain_const_fps) {
 				DSI_DEBUG("Mode switch is seamless variable refresh\n");
+#if 0  // we do not need to flag VRR cause' we already using our own FPS switching scheme
 				adj_mode->dsi_mode_flags |= DSI_MODE_FLAG_VRR;
-				SDE_EVT32(SDE_EVTLOG_FUNC_CASE1,
-					cur_mode->timing.refresh_rate,
+#endif
+				SDE_EVT32(cur_mode->timing.refresh_rate,
 					adj_mode->timing.refresh_rate,
 					cur_mode->timing.h_front_porch,
-					adj_mode->timing.h_front_porch,
-					cur_mode->timing.v_front_porch,
-					adj_mode->timing.v_front_porch);
+					adj_mode->timing.h_front_porch);
 			}
 		}
 
@@ -7561,9 +8574,8 @@ int dsi_display_validate_mode_change(struct dsi_display *display,
 
 				adj_mode->dsi_mode_flags |=
 						DSI_MODE_FLAG_DYN_CLK;
-				SDE_EVT32(SDE_EVTLOG_FUNC_CASE2,
-					cur_mode->pixel_clk_khz,
-					adj_mode->pixel_clk_khz);
+				SDE_EVT32(cur_mode->pixel_clk_khz,
+						adj_mode->pixel_clk_khz);
 			}
 		}
 	}
@@ -7675,11 +8687,15 @@ int dsi_display_set_mode(struct dsi_display *display,
 		goto error;
 	}
 
-	DSI_INFO("mdp_transfer_time_us=%d us\n",
+	printk("[Display] mdp_transfer_time_us=%d us\n",
 			adj_mode.priv_info->mdp_transfer_time_us);
-	DSI_INFO("hactive= %d,vactive= %d,fps=%d\n",
+	printk("[Display] hactive= %d,vactive= %d,fps=%d\n",
 			timing.h_active, timing.v_active,
 			timing.refresh_rate);
+	if (timing.refresh_rate > 144) {
+		pr_err("[Display] refresh rate was set to %d, which intension is %d\n", timing.refresh_rate, asus_current_fps);
+	}
+
 
 	memcpy(display->panel->cur_mode, &adj_mode, sizeof(adj_mode));
 error:
@@ -8054,6 +9070,7 @@ int dsi_display_prepare(struct dsi_display *display)
 		return -EINVAL;
 	}
 
+	pr_err("[Display] display on +++ \n");
 	SDE_EVT32(SDE_EVTLOG_FUNC_ENTRY);
 	mutex_lock(&display->display_lock);
 
@@ -8201,8 +9218,27 @@ error:
 	mutex_unlock(&display->display_lock);
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
 
+	/* ASUS BSP Display +++ */
+	// mark display ready here to accept command settings
 	display->panel->panel_ready_for_cmd = true;
-	
+
+	// doing first bootup job here
+	if (display->panel->panel_first_bootup) {
+		asus_display_set_local_hbm(0);
+		display->panel->panel_first_bootup = false;
+	}
+
+	// fetch OSC value from DDIC and save it for future setting
+	if (!asus_var_osc_reg_feteched) {
+		asus_display_read_panel_osc(display);
+
+		printk("[Display] first boot set 60 fps, type 2\n");
+		dsi_panel_asus_switch_fps(display->panel, 2);
+	}
+	/* ASUS BSP Display --- */
+
+	pr_err("[Display] display on --- \n");
+
 	return rc;
 }
 
@@ -8264,7 +9300,7 @@ static int dsi_display_qsync(struct dsi_display *display, bool enable)
 	int i;
 	int rc = 0;
 
-	if (!display->panel->qsync_caps.qsync_min_fps) {
+	if (!display->panel->qsync_min_fps) {
 		DSI_ERR("%s:ERROR: qsync set, but no fps\n", __func__);
 		return 0;
 	}
@@ -8292,7 +9328,7 @@ static int dsi_display_qsync(struct dsi_display *display, bool enable)
 	}
 
 exit:
-	SDE_EVT32(enable, display->panel->qsync_caps.qsync_min_fps, rc);
+	SDE_EVT32(enable, display->panel->qsync_min_fps, rc);
 	mutex_unlock(&display->display_lock);
 	return rc;
 }
@@ -8473,6 +9509,8 @@ int dsi_display_enable(struct dsi_display *display)
 	int rc = 0;
 	struct dsi_display_mode *mode;
 
+	printk("[Display] panel enable +++ \n");
+
 	if (!display || !display->panel) {
 		DSI_ERR("Invalid params\n");
 		return -EINVAL;
@@ -8574,6 +9612,7 @@ error_disable_panel:
 error:
 	mutex_unlock(&display->display_lock);
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
+	printk("[Display] panel enable --- \n");
 	return rc;
 }
 
@@ -8680,6 +9719,9 @@ int dsi_display_disable(struct dsi_display *display)
 		return -EINVAL;
 	}
 
+	pr_err("[Display] display off +++ \n");
+
+	// set panel ready to false to prevent future command setting
 	display->panel->panel_ready_for_cmd = false;
 
 	SDE_EVT32(SDE_EVTLOG_FUNC_ENTRY);
@@ -8714,7 +9756,13 @@ int dsi_display_disable(struct dsi_display *display)
 
 	// reset panel HBM related variable
 	display->panel->asus_hbm_mode = 0;
-		
+	display->panel->asus_global_hbm_mode = 0;
+	display->panel->asus_local_hbm_mode = 0;
+	old_has_fov_makser = false;
+	asus_drm_notify(ASUS_NOTIFY_SPOT_READY, 0);
+	asus_drm_notify(ASUS_NOTIFY_GHBM_ON_READY, 0);
+	asus_drm_notify(ASUS_NOTIFY_GHBM_ON_REQ, 0);
+
 	mutex_unlock(&display->display_lock);
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
 	return rc;
@@ -8823,6 +9871,9 @@ int dsi_display_unprepare(struct dsi_display *display)
 	dsi_display_unregister_error_handler(display);
 
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
+
+	asus_var_ever_power_off = true;
+	pr_err("[Display] display off --- \n");
 	return rc;
 }
 

@@ -126,7 +126,6 @@ struct sde_plane {
 	struct sde_csc_cfg *csc_usr_ptr;
 	struct sde_csc_cfg *csc_ptr;
 
-	uint32_t cached_lut_flag;
 	const struct sde_sspp_sub_blks *pipe_sblk;
 
 	char pipe_name[SDE_NAME_SIZE];
@@ -249,7 +248,6 @@ static void _sde_plane_set_qos_lut(struct drm_plane *plane,
 	u32 frame_rate, qos_count, fps_index = 0, lut_index, index;
 	struct sde_perf_cfg *perf;
 	struct sde_plane_state *pstate;
-	struct sde_kms *kms;
 
 	if (!plane || !fb) {
 		SDE_ERROR("invalid arguments\n");
@@ -258,11 +256,6 @@ static void _sde_plane_set_qos_lut(struct drm_plane *plane,
 
 	psde = to_sde_plane(plane);
 	pstate = to_sde_plane_state(plane->state);
-	kms = _sde_plane_get_kms(plane);
-	if (!kms) {
-		SDE_ERROR("invalid kms\n");
-		return;
-	}
 
 	if (!psde->pipe_hw || !psde->pipe_sblk || !psde->catalog) {
 		SDE_ERROR("invalid arguments\n");
@@ -289,12 +282,7 @@ static void _sde_plane_set_qos_lut(struct drm_plane *plane,
 				fb->format->format,
 				fb->modifier);
 
-		if (fmt && SDE_FORMAT_IS_LINEAR(fmt) &&
-			pstate->scaler3_cfg.enable &&
-			IS_SDE_MAJOR_MINOR_SAME(kms->catalog->hwversion,
-							 SDE_HW_VER_640))
-			lut_index = SDE_QOS_LUT_USAGE_MACROTILE_QSEED;
-		else if (fmt && SDE_FORMAT_IS_LINEAR(fmt))
+		if (fmt && SDE_FORMAT_IS_LINEAR(fmt))
 			lut_index = SDE_QOS_LUT_USAGE_LINEAR;
 		else if (pstate->scaler3_cfg.enable)
 			lut_index = SDE_QOS_LUT_USAGE_MACROTILE_QSEED;
@@ -2563,39 +2551,6 @@ static int _sde_plane_validate_shared_crtc(struct sde_plane *psde,
 
 }
 
-static int _sde_plane_validate_fb(struct sde_plane *psde,
-				struct drm_plane_state *state)
-{
-	struct sde_plane_state *pstate;
-	struct drm_framebuffer *fb;
-	uint32_t fb_ns = 0, fb_sec = 0, fb_sec_dir = 0;
-	unsigned long flags = 0;
-	int mode, ret = 0, n, i;
-
-	pstate = to_sde_plane_state(state);
-	mode = sde_plane_get_property(pstate,
-				PLANE_PROP_FB_TRANSLATION_MODE);
-
-	fb = state->fb;
-	n = fb->format->num_planes;
-	for (i = 0; i < n; i++) {
-		ret = msm_fb_obj_get_attrs(fb->obj[i], &fb_ns, &fb_sec,
-			&fb_sec_dir, &flags);
-
-		if (!ret && ((fb_ns && (mode != SDE_DRM_FB_NON_SEC)) ||
-			(fb_sec && (mode != SDE_DRM_FB_SEC)) ||
-			(fb_sec_dir && (mode != SDE_DRM_FB_SEC_DIR_TRANS)))) {
-			SDE_ERROR_PLANE(psde, "mode:%d fb:%d flag:0x%x rc:%d\n",
-			mode, fb->base.id, flags, ret);
-			SDE_EVT32(psde->base.base.id, fb->base.id, flags,
-			fb_ns, fb_sec, fb_sec_dir, ret, SDE_EVTLOG_ERROR);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
 static int sde_plane_sspp_atomic_check(struct drm_plane *plane,
 		struct drm_plane_state *state)
 {
@@ -2705,11 +2660,6 @@ static int sde_plane_sspp_atomic_check(struct drm_plane *plane,
 		return ret;
 
 	ret = _sde_plane_validate_shared_crtc(psde, state);
-
-	if (ret)
-		return ret;
-
-	ret = _sde_plane_validate_fb(psde, state);
 
 	if (ret)
 		return ret;
@@ -3202,21 +3152,6 @@ static void _sde_plane_update_properties(struct drm_plane *plane,
 	pstate->dirty = 0x0;
 }
 
-static void _sde_plane_check_lut_dirty(struct sde_plane *psde,
-			struct sde_plane_state *pstate)
-{
-	/**
-	 * Valid configuration if scaler is not enabled or
-	 * lut flag is set
-	 */
-	if (pstate->scaler3_cfg.lut_flag || !pstate->scaler3_cfg.enable)
-		return;
-
-	pstate->scaler3_cfg.lut_flag = psde->cached_lut_flag;
-	SDE_EVT32(DRMID(&psde->base), pstate->scaler3_cfg.lut_flag,
-		SDE_EVTLOG_ERROR);
-}
-
 static int sde_plane_sspp_atomic_update(struct drm_plane *plane,
 				struct drm_plane_state *old_state)
 {
@@ -3267,16 +3202,10 @@ static int sde_plane_sspp_atomic_update(struct drm_plane *plane,
 			state->crtc_w, state->crtc_h,
 			state->crtc_x, state->crtc_y);
 
-	/* Caching the valid lut flag in sde plane */
-	if (pstate->scaler3_cfg.enable &&
-			pstate->scaler3_cfg.lut_flag)
-		psde->cached_lut_flag = pstate->scaler3_cfg.lut_flag;
-
 	/* force reprogramming of all the parameters, if the flag is set */
 	if (psde->revalidate) {
 		SDE_DEBUG("plane:%d - reconfigure all the parameters\n",
 				plane->base.id);
-		_sde_plane_check_lut_dirty(psde, pstate);
 		pstate->dirty = SDE_PLANE_DIRTY_ALL | SDE_PLANE_DIRTY_CP;
 		psde->revalidate = false;
 	}
@@ -4189,7 +4118,6 @@ static void sde_plane_destroy_state(struct drm_plane *plane,
 	/* remove ref count for fence */
 	if (pstate->input_fence)
 		sde_sync_put(pstate->input_fence);
-	pstate->input_fence = 0;
 
 	/* destroy value helper */
 	msm_property_destroy_state(&psde->property_info, pstate,
@@ -4623,8 +4551,7 @@ struct drm_plane *sde_plane_init(struct drm_device *dev,
 		SDE_ERROR("[%u]SSPP init failed\n", pipe);
 		ret = PTR_ERR(psde->pipe_hw);
 		goto clean_plane;
-	} else if (!psde->pipe_hw || !psde->pipe_hw->cap ||
-					 !psde->pipe_hw->cap->sblk) {
+	} else if (!psde->pipe_hw->cap || !psde->pipe_hw->cap->sblk) {
 		SDE_ERROR("[%u]SSPP init returned invalid cfg\n", pipe);
 		goto clean_sspp;
 	}

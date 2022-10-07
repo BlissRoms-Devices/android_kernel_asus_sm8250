@@ -25,12 +25,7 @@ ifeq ($(CONFIG_ARCH_BENGAL), y)
 LINUXINCLUDE    += -include $(srctree)/techpack/display/config/bengaldispconf.h
 endif
 
-# ZS661KL obiwan uses obiwan_msm
-ifdef CONFIG_MACH_ASUS_ZS661KS
-obj-$(CONFIG_DRM_MSM) += obiwan_msm/
-else
 obj-$(CONFIG_DRM_MSM) += msm/
-endif
 
 
 obj-$(CONFIG_MSM_SDE_ROTATOR) += rotator/

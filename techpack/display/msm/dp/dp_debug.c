@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  */
 
@@ -155,7 +154,7 @@ static ssize_t dp_debug_write_edid(struct file *file,
 	edid = debug->edid;
 bail:
 	kfree(buf);
-	debug->panel->set_edid(debug->panel, edid, debug->edid_size);
+	debug->panel->set_edid(debug->panel, edid);
 
 	/*
 	 * print edid status as this code is executed
@@ -1629,7 +1628,7 @@ static void dp_debug_set_sim_mode(struct dp_debug_private *debug, bool sim)
 		debug->aux->set_sim_mode(debug->aux, false, NULL, NULL);
 		debug->dp_debug.sim_mode = false;
 
-		debug->panel->set_edid(debug->panel, 0, 0);
+		debug->panel->set_edid(debug->panel, 0);
 		if (debug->edid) {
 			devm_kfree(debug->dev, debug->edid);
 			debug->edid = NULL;
@@ -1900,6 +1899,35 @@ static const struct file_operations hdcp_fops = {
 	.write = dp_debug_write_hdcp,
 	.read = dp_debug_read_hdcp,
 };
+/* ASUS BSP Display +++ */
+static ssize_t dp_debug_read_aux_err(struct file *file,
+		char __user *user_buff, size_t count, loff_t *ppos)
+{
+	struct dp_debug_private *debug = file->private_data;
+	char buf[SZ_8];
+	u32 len = 0;
+
+	if (!debug)
+		return -ENODEV;
+
+	if (*ppos)
+		return 0;
+
+	len += snprintf(buf, SZ_8, "%d\n", debug->dp_debug.aux_err);
+
+	len = min_t(size_t, count, len);
+	if (copy_to_user(user_buff, buf, len))
+		return -EFAULT;
+
+	*ppos += len;
+	return len;
+}
+
+static const struct file_operations aux_err_fops = {
+	.open = simple_open,
+	.read = dp_debug_read_aux_err,
+};
+/* ASUS BSP Display --- */
 
 static const struct file_operations widebus_mode_fops = {
 	.open = simple_open,
@@ -2075,6 +2103,15 @@ static int dp_debug_init(struct dp_debug *dp_debug)
 			DEBUG_NAME, rc);
 		goto error_remove_dir;
 	}
+	/* ASUS BSP Display +++ */
+	file = debugfs_create_file("aux_err", 0644, dir, debug, &aux_err_fops);
+	if (IS_ERR_OR_NULL(file)) {
+		rc = PTR_ERR(file);
+		DP_ERR("[%s] debugfs aux_err failed, rc=%d\n",
+		       DEBUG_NAME, rc);
+		return rc;
+	}
+	/* ASUS BSP Display --- */
 
 	file = debugfs_create_file("sim", 0644, dir,
 		debug, &sim_fops);
@@ -2285,7 +2322,6 @@ struct dp_debug *dp_debug_get(struct dp_debug_in *in)
 	dp_debug->dp_mst_connector_list.con_id = -1;
 	dp_debug->dp_mst_connector_list.conn = NULL;
 	dp_debug->dp_mst_connector_list.debug_en = false;
-	mutex_init(&dp_debug->dp_mst_connector_list.lock);
 
 	dp_debug->max_pclk_khz = debug->parser->max_pclk_khz;
 

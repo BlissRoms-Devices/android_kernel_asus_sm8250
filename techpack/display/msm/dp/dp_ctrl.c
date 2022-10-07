@@ -90,6 +90,8 @@ enum notification_status {
 	NOTIFY_DISCONNECT_IRQ_HPD,
 };
 
+extern bool dp_asus_is_station(void);
+
 static void dp_ctrl_idle_patterns_sent(struct dp_ctrl_private *ctrl)
 {
 	DP_DEBUG("idle_patterns_sent\n");
@@ -196,12 +198,12 @@ static int dp_ctrl_update_sink_vx_px(struct dp_ctrl_private *ctrl)
 	u32 max_level_reached = 0;
 
 	if (v_level == DP_LINK_VOLTAGE_MAX) {
-		DP_DEBUG("max voltage swing level reached %d\n", v_level);
+		printk("[drm-dp] max voltage swing level reached %d\n", v_level);
 		max_level_reached |= DP_TRAIN_MAX_SWING_REACHED;
 	}
 
 	if (p_level == DP_LINK_PRE_EMPHASIS_MAX) {
-		DP_DEBUG("max pre-emphasis level reached %d\n", p_level);
+		printk("[drm-dp] max pre-emphasis level reached %d\n", p_level);
 		max_level_reached |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
 	}
 
@@ -210,7 +212,7 @@ static int dp_ctrl_update_sink_vx_px(struct dp_ctrl_private *ctrl)
 	for (i = 0; i < size; i++)
 		buf[i] = v_level | p_level | max_level_reached;
 
-	DP_DEBUG("lanes: %d, swing: 0x%x, pre-emp: 0x%x\n",
+	printk("[drm-dp] lanes: %d, swing: 0x%x, pre-emp: 0x%x\n",
 			size, v_level, p_level);
 
 	ret = drm_dp_dpcd_write(ctrl->aux->drm_aux,
@@ -237,7 +239,7 @@ static int dp_ctrl_update_sink_pattern(struct dp_ctrl_private *ctrl, u8 pattern)
 	u8 buf = pattern;
 	int ret;
 
-	DP_DEBUG("sink: pattern=%x\n", pattern);
+	DP_ERR("sink: pattern=%x\n", pattern);
 
 	if (pattern && pattern != DP_TRAINING_PATTERN_4)
 		buf |= DP_LINK_SCRAMBLING_DISABLE;
@@ -334,6 +336,7 @@ static int dp_ctrl_link_training_1(struct dp_ctrl_private *ctrl)
 
 	tries = 0;
 	old_v_level = ctrl->link->phy_params.v_level;
+	printk("[drm-dp] training from v_level %d\n",  old_v_level);
 	while (!atomic_read(&ctrl->aborted)) {
 		/* update hardware with current swing/pre-emp values */
 		dp_ctrl_update_hw_vx_px(ctrl);
@@ -365,8 +368,15 @@ static int dp_ctrl_link_training_1(struct dp_ctrl_private *ctrl)
 		else
 			break;
 
+		// skip clock recovery if in station mode
+		if (dp_asus_is_station()) {
+			printk("[drm-dp] clock recovery failure, skip it in station\n");
+			ret = 0;
+			break;
+		}
+
 		if (ctrl->link->phy_params.v_level == DP_LINK_VOLTAGE_MAX) {
-			pr_err_ratelimited("max v_level reached\n");
+			pr_err_ratelimited("[drm-dp] max v_level reached\n");
 			break;
 		}
 
@@ -381,8 +391,9 @@ static int dp_ctrl_link_training_1(struct dp_ctrl_private *ctrl)
 			old_v_level = ctrl->link->phy_params.v_level;
 		}
 
-		DP_DEBUG("clock recovery not done, adjusting vx px\n");
+		printk("[drm-dp] clock recovery not done, adjusting vx px\n");
 
+		//calling dp_link_adjust_levels
 		ctrl->link->adjust_levels(ctrl->link, link_status);
 	}
 
@@ -520,6 +531,7 @@ static int dp_ctrl_link_train(struct dp_ctrl_private *ctrl)
 	u8 const encoding = 0x1, downspread = 0x00;
 	struct drm_dp_link link_info = {0};
 
+	DP_ERR("[drm-dp] reset p_level and v_level\n");
 	ctrl->link->phy_params.p_level = 0;
 	ctrl->link->phy_params.v_level = 0;
 
@@ -996,15 +1008,14 @@ static void dp_ctrl_mst_calculate_rg(struct dp_ctrl_private *ctrl,
 	u64 raw_target_sc, target_sc_fixp;
 	u64 ts_denom, ts_enum, ts_int;
 	u64 pclk = panel->pinfo.pixel_clk_khz;
-	u64 lclk = 0;
-	u64 lanes = ctrl->link->link_params.lane_count;
+	u64 lclk = panel->link_info.rate;
+	u64 lanes = panel->link_info.num_lanes;
 	u64 bpp = panel->pinfo.bpp;
 	u64 pbn = panel->pbn;
 	u64 numerator, denominator, temp, temp1, temp2;
 	u32 x_int = 0, y_frac_enum = 0;
 	u64 target_strm_sym, ts_int_fixp, ts_frac_fixp, y_frac_enum_fixp;
 
-	lclk = drm_dp_bw_code_to_link_rate(ctrl->link->link_params.bw_code);
 	if (panel->pinfo.comp_info.comp_ratio)
 		bpp = panel->pinfo.comp_info.dsc_info.bpp;
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
  */
 
 #ifndef _DSI_PANEL_H_
@@ -84,13 +84,6 @@ struct dsi_dfps_capabilities {
 	bool dfps_support;
 };
 
-struct dsi_qsync_capabilities {
-	/* qsync disabled if qsync_min_fps = 0 */
-	u32 qsync_min_fps;
-	u32 *qsync_min_fps_list;
-	int qsync_min_fps_list_len;
-};
-
 struct dsi_dyn_clk_caps {
 	bool dyn_clk_support;
 	u32 *bit_clk_list;
@@ -122,7 +115,6 @@ struct dsi_backlight_config {
 	u32 bl_scale;
 	u32 bl_scale_sv;
 	bool bl_inverted_dbv;
-	u32 bl_dcs_subtype;
 
 	int en_gpio;
 	/* PWM params */
@@ -215,7 +207,7 @@ struct dsi_panel {
 
 	bool panel_initialized;
 	bool te_using_watchdog_timer;
-	struct dsi_qsync_capabilities qsync_caps;
+	u32 qsync_min_fps;
 
 	char dsc_pps_cmd[DSI_CMD_PPS_SIZE];
 	enum dsi_dms_mode dms_mode;
@@ -223,12 +215,24 @@ struct dsi_panel {
 	bool sync_broadcast_en;
 
 	int panel_test_gpio;
-	int vddr_enable_gpio;
 	int power_mode;
 	enum dsi_panel_physical_type panel_type;
 
+	// ASUS parameters
 	bool panel_ready_for_cmd;
+	bool panel_first_bootup;
 	int asus_hbm_mode;
+	int asus_dim_mode;
+	int asus_bl_delay;
+	int asus_global_hbm_mode;
+	int asus_global_hbm_pending_mode;
+	int asus_local_hbm_mode;
+	int asus_global_hbm_cached_bl;
+	int asus_last_user_aod_bl;
+
+	char asus_initial_code_version[16];
+	char asus_initial_code_description[32];
+	u64 asus_boost_panel_clock_rate_hz;
 };
 
 static inline bool dsi_panel_ulps_feature_enabled(struct dsi_panel *panel)
@@ -349,8 +353,16 @@ void dsi_panel_ext_bridge_put(struct dsi_panel *panel);
 void dsi_panel_calc_dsi_transfer_time(struct dsi_host_common_cfg *config,
 		struct dsi_display_mode *mode, u32 frame_threshold_us);
 
-int dsi_panel_asus_switch_fps(struct dsi_panel *panel);
-
-int dsi_panel_set_dimming_speed(struct dsi_panel *panel,int val);
+/*
+ * ASUS ROG3 display protocol panel functions
+ */
+int dsi_panel_asus_switch_fps(struct dsi_panel *panel, int type);
+int dsi_panel_set_osc(struct dsi_panel *panel);
+int dsi_panel_set_idle(struct dsi_panel *panel, bool enter);
+void dsi_panel_bl_delay(struct dsi_panel *panel);
+int dsi_panel_set_hbm(struct dsi_panel *panel, bool enable);
+int dsi_panel_set_global_hbm(struct dsi_panel *panel, bool enable);
+int dsi_panel_set_local_hbm(struct dsi_panel *panel, bool enable);
+int dsi_panel_set_bus_dim(struct dsi_panel *panel, int refresh_rate);
 
 #endif /* _DSI_PANEL_H_ */

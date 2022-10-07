@@ -29,6 +29,11 @@
 #define MAX_VOLTAGE_LEVELS 4
 #define MAX_PRE_EMP_LEVELS 4
 
+/* ASUS BSP DP +++ */
+extern int gDongleType;
+extern int asus_current_fps;
+/* ASUS BSP DP --- */
+
 static u8 const vm_pre_emphasis[MAX_VOLTAGE_LEVELS][MAX_PRE_EMP_LEVELS] = {
 	{0x00, 0x0E, 0x16, 0xFF},       /* pe0, 0 db */
 	{0x00, 0x0E, 0x16, 0xFF},       /* pe1, 3.5 db */
@@ -239,11 +244,11 @@ static void dp_catalog_ctrl_update_vx_px_v420(struct dp_catalog_ctrl *ctrl,
 
 	if (!ctrl || !((v_level < MAX_VOLTAGE_LEVELS)
 		&& (p_level < MAX_PRE_EMP_LEVELS))) {
-		DP_ERR("invalid input\n");
+		printk("[msm-dp] invalid input\n");
 		return;
 	}
 
-	DP_DEBUG("hw: v=%d p=%d, high=%d\n", v_level, p_level, high);
+	printk("[msm-dp] hw: v=%d p=%d, high=%d\n", v_level, p_level, high);
 
 	catalog = dp_catalog_get_priv_v420(ctrl);
 
@@ -274,6 +279,12 @@ static void dp_catalog_ctrl_update_vx_px_v420(struct dp_catalog_ctrl *ctrl,
 	io_data = catalog->io->dp_ln_tx1;
 	dp_write(TXn_TX_DRV_LVL_V420, 0x2A);
 	dp_write(TXn_TX_EMP_POST1_LVL, 0x20);
+	/* ASUS BSP DP +++ */
+	// for station
+	if (asus_current_fps >= 120 && gDongleType == 2 && v_level == 0 && p_level == 0) {
+		value0 = 0x10; /* tuned from Yoda */
+	}
+	/* ASUS BSP DP --- */
 
 	/* Enable MUX to use Cursor values from these registers */
 	value0 |= BIT(5);
@@ -289,10 +300,10 @@ static void dp_catalog_ctrl_update_vx_px_v420(struct dp_catalog_ctrl *ctrl,
 		dp_write(TXn_TX_DRV_LVL_V420, value0);
 		dp_write(TXn_TX_EMP_POST1_LVL, value1);
 
-		DP_DEBUG("hw: vx_value=0x%x px_value=0x%x\n",
+		printk("[drm-dp] hw: vx_value=0x%x px_value=0x%x\n",
 			value0, value1);
 	} else {
-		DP_ERR("invalid vx (0x%x=0x%x), px (0x%x=0x%x\n",
+		printk("[drm-dp] invalid vx (0x%x=0x%x), px (0x%x=0x%x\n",
 			v_level, value0, p_level, value1);
 	}
 }

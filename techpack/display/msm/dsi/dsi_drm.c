@@ -11,7 +11,7 @@
 #include "sde_connector.h"
 #include "dsi_drm.h"
 #include "sde_trace.h"
-#include "sde_dbg.h"
+#include "sde_encoder.h"
 
 #define to_dsi_bridge(x)     container_of((x), struct dsi_bridge, base)
 #define to_dsi_state(x)      container_of((x), struct dsi_connector_state, base)
@@ -21,16 +21,10 @@
 #define DEFAULT_PANEL_JITTER_ARRAY_SIZE		2
 #define DEFAULT_PANEL_PREFILL_LINES	25
 
-static struct dsi_display_mode_priv_info default_priv_info = {
-	.panel_jitter_numer = DEFAULT_PANEL_JITTER_NUMERATOR,
-	.panel_jitter_denom = DEFAULT_PANEL_JITTER_DENOMINATOR,
-	.panel_prefill_lines = DEFAULT_PANEL_PREFILL_LINES,
-	.dsc_enabled = false,
-};
-
+/* ASUS BSP Display +++ */
 extern bool asus_display_in_normal_off(void);
 
-static void dsi_bridge_asus_dfps(struct drm_bridge *bridge)
+static void dsi_bridge_asus_dfps(struct drm_bridge *bridge, int type)
 {
 	int rc = 0;
 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
@@ -45,13 +39,21 @@ static void dsi_bridge_asus_dfps(struct drm_bridge *bridge)
 		return;
 	}
 
-	rc = dsi_display_asus_dfps(c_bridge->display);
+	rc = dsi_display_asus_dfps(c_bridge->display, type);
 	if (rc) {
 		pr_err("[%d] failed to perform a fps set, rc=%d\n",
 			c_bridge->id, rc);
 		return;
 	}
 }
+/* ASUS BSP Display --- */
+
+static struct dsi_display_mode_priv_info default_priv_info = {
+	.panel_jitter_numer = DEFAULT_PANEL_JITTER_NUMERATOR,
+	.panel_jitter_denom = DEFAULT_PANEL_JITTER_DENOMINATOR,
+	.panel_prefill_lines = DEFAULT_PANEL_PREFILL_LINES,
+	.dsc_enabled = false,
+};
 
 static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
 				struct dsi_display_mode *dsi_mode)
@@ -434,32 +436,16 @@ static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
 		if ((dsi_mode.panel_mode != cur_dsi_mode.panel_mode) &&
 			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_VRR)) &&
 			(crtc_state->enable ==
-				crtc_state->crtc->state->enable)) {
+				crtc_state->crtc->state->enable))
 			dsi_mode.dsi_mode_flags |= DSI_MODE_FLAG_POMS;
-
-			SDE_EVT32(SDE_EVTLOG_FUNC_CASE1,
-				dsi_mode.timing.h_active,
-				dsi_mode.timing.v_active,
-				dsi_mode.timing.refresh_rate,
-				dsi_mode.pixel_clk_khz,
-				dsi_mode.panel_mode);
-		}
 		/* No DMS/VRR when drm pipeline is changing */
 		if (!drm_mode_equal(cur_mode, adjusted_mode) &&
 			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_VRR)) &&
 			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_POMS)) &&
 			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_DYN_CLK)) &&
 			(!crtc_state->active_changed ||
-			 display->is_cont_splash_enabled)) {
+			 display->is_cont_splash_enabled))
 			dsi_mode.dsi_mode_flags |= DSI_MODE_FLAG_DMS;
-
-			SDE_EVT32(SDE_EVTLOG_FUNC_CASE2,
-				dsi_mode.timing.h_active,
-				dsi_mode.timing.v_active,
-				dsi_mode.timing.refresh_rate,
-				dsi_mode.pixel_clk_khz,
-				dsi_mode.panel_mode);
-		}
 	}
 
 	/* Reject seamless transition when active changed */
@@ -613,16 +599,14 @@ int dsi_conn_set_info_blob(struct drm_connector *connector,
 	case DSI_OP_VIDEO_MODE:
 		sde_kms_info_add_keystr(info, "panel mode", "video");
 		sde_kms_info_add_keystr(info, "qsync support",
-				panel->qsync_caps.qsync_min_fps ?
-				"true" : "false");
+				panel->qsync_min_fps ? "true" : "false");
 		break;
 	case DSI_OP_CMD_MODE:
 		sde_kms_info_add_keystr(info, "panel mode", "command");
 		sde_kms_info_add_keyint(info, "mdp_transfer_time_us",
 				mode_info->mdp_transfer_time_us);
 		sde_kms_info_add_keystr(info, "qsync support",
-				panel->qsync_caps.qsync_min_fps ?
-				"true" : "false");
+				panel->qsync_min_fps ? "true" : "false");
 		break;
 	default:
 		DSI_DEBUG("invalid panel type:%d\n", panel->panel_mode);
