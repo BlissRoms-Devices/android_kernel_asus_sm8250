@@ -74,7 +74,6 @@ struct gesture_module {
 	atomic_t zen_motion;
 	atomic_t dclick;
 	atomic_t swipeup;
-	atomic_t aod_enable;
 	atomic_t music_control;
 	atomic_t fp_wakeup;
 	atomic_t aod_ctrl_mode;
@@ -233,33 +232,7 @@ static ssize_t gsx_gesture_data_show(struct goodix_ext_module *module,
 static ssize_t gsx_aod_enable_show(struct goodix_ext_module *module,
 		char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&gsx_gesture->aod_enable));
-}
-
-static ssize_t gsx_aod_enable_store(struct goodix_ext_module *module,
-		const char *buf, size_t count)
-{
-	unsigned int tmp;
-
-	if (sscanf(buf, "%u", &tmp) != 1) {
-		ts_info("Parameter illegal");
-		return -EINVAL;
-	}
-	ts_debug("AOD enable =%d", tmp);
-
-	if (tmp == 1) {
-		atomic_set(&gsx_gesture->aod_enable, 1);
-	} else {
-		atomic_set(&gsx_gesture->aod_enable, 0);
-		if(get_aod_processing()) {
-			ts_info("[KEY_U] aod_enable = 0");
-			enable_aod_processing(false);
-		}
-	}
-
-	check_power();  
-
-	return count;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", in_aod_doze_mode);
 }
 
 static ssize_t gsx_fp_wakeup_enable_show(struct goodix_ext_module *module,
@@ -420,8 +393,8 @@ const struct goodix_ext_attribute gesture_attrs[] = {
 		gsx_zenmotion_enable_store),
 	__EXTMOD_ATTR(dclick, 0666, gsx_dclick_enable_show,
 		gsx_dclick_enable_store),
-	__EXTMOD_ATTR(aod_enable, 0666, gsx_aod_enable_show,
-		gsx_aod_enable_store),
+	__EXTMOD_ATTR(aod_enable, 0444, gsx_aod_enable_show,
+		NULL),
 	__EXTMOD_ATTR(swipeup, 0666, gsx_swipeup_enable_show,
 		gsx_swipeup_enable_store),
 	__EXTMOD_ATTR(fp_wakeup, 0666, gsx_fp_wakeup_enable_show,
@@ -652,7 +625,6 @@ static int gsx_gesture_init(struct goodix_ts_core *core_data,
 // ASUS_BSP +++ Touch
 	atomic_set(&gsx_gesture->dclick, 0);
 	atomic_set(&gsx_gesture->swipeup, 0);
-	atomic_set(&gsx_gesture->aod_enable, 0);
 	atomic_set(&gsx_gesture->zen_motion, 0);
 	atomic_set(&gsx_gesture->fp_wakeup, 0);
 	atomic_set(&gsx_gesture->music_control, 0);
@@ -675,7 +647,6 @@ static int gsx_gesture_exit(struct goodix_ts_core *core_data,
 // ASUS_BSP +++ Touch
 	atomic_set(&gsx_gesture->dclick, 0);
 	atomic_set(&gsx_gesture->swipeup, 0);
-	atomic_set(&gsx_gesture->aod_enable, 0);
 	atomic_set(&gsx_gesture->zen_motion, 0);
 	atomic_set(&gsx_gesture->fp_wakeup, 0);
 	atomic_set(&gsx_gesture->music_control, 0);
@@ -693,7 +664,6 @@ static int check_power(void)
 	if ((atomic_read(&gsx_gesture->zen_motion) == 0) &&
 		(atomic_read(&gsx_gesture->dclick) == 0) &&
 		(atomic_read(&gsx_gesture->swipeup) == 0) &&
-		(atomic_read(&gsx_gesture->aod_enable) == 0) &&
 		(atomic_read(&gsx_gesture->fp_wakeup) == 0) &&
 		(atomic_read(&gsx_gesture->aod_ctrl_mode) == 0)) {
 		enable_power = false;
@@ -1118,7 +1088,6 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *core_data,
 	if ((atomic_read(&gsx_gesture->zen_motion) == 0) &&
 		(atomic_read(&gsx_gesture->dclick) == 0) &&
 		(atomic_read(&gsx_gesture->swipeup) == 0) &&
-		(atomic_read(&gsx_gesture->aod_enable) == 0) &&
 		(atomic_read(&gsx_gesture->fp_wakeup) == 0) &&
 		(atomic_read(&gsx_gesture->aod_ctrl_mode) == 0)) {
 		ts_info("Gesture not enable, going to deep sleep mode");
