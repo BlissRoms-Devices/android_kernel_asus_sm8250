@@ -52,7 +52,7 @@
 		qcom,mdss-dsi-te-check-enable;
 		qcom,mdss-dsi-te-using-te-pin;
 
-		qcom,dsi-supported-dfps-list = <160 144 120 90 60>;
+		qcom,dsi-supported-dfps-list = <144 120 90 60>;
 		qcom,mdss-dsi-pan-enable-dynamic-fps;
 		qcom,mdss-dsi-pan-fps-update =
 			"dfps_immediate_porch_mode_vfp";
